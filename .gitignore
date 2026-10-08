@@ -1,0 +1,24 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Virtual environments (if created inside the project folder)
+env/
+venv/
+.conda/
+
+# Large EEG Data and logs (CRITICAL)
+*.edf
+*.fif
+*.set
+*.fdt
+*.bdf
+*.log
+data/
