@@ -40,13 +40,40 @@ try:
 except ImportError:
     pass
 
-from config import STANDARD_64_CHANNELS
-from engine import EEGDataLoader, PlaybackEngine
-from workstation import AnalysisPanelWidget
-from viewports import TopomapContainerWidget
-from ui_components import (
-    WaveformsWidget, SpotifyPlaybackBar, HeaderWidget, ControlSidebarWidget
-)
+# ==============================================================================
+# AUTOMATIC PATH BOOTSTRAP (Supports root execution, src/neuromap layout & VS Code)
+# ==============================================================================
+from pathlib import Path
+_root = Path(__file__).resolve().parent
+for _cand in [
+    _root / 'src' / 'neuromap',
+    _root / 'src',
+    _root,
+    _root.parent / 'src' / 'neuromap',
+    _root.parent / 'src',
+    _root.parent,
+]:
+    _cand_str = str(_cand)
+    if _cand.is_dir() and _cand_str not in sys.path:
+        sys.path.insert(0, _cand_str)
+
+try:
+    from neuromap.config import STANDARD_64_CHANNELS
+    from neuromap.engine import EEGDataLoader, PlaybackEngine
+    from neuromap.workstation import AnalysisPanelWidget
+    from neuromap.viewports import TopomapContainerWidget
+    from neuromap.ui_components import (
+        WaveformsWidget, SpotifyPlaybackBar, HeaderWidget, ControlSidebarWidget
+    )
+except (ImportError, ModuleNotFoundError):
+    from config import STANDARD_64_CHANNELS
+    from engine import EEGDataLoader, PlaybackEngine
+    from workstation import AnalysisPanelWidget
+    from viewports import TopomapContainerWidget
+    from ui_components import (
+        WaveformsWidget, SpotifyPlaybackBar, HeaderWidget, ControlSidebarWidget
+    )
+
 
 
 class NeuromapMainWindow(QMainWindow):
