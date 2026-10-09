@@ -1,13 +1,17 @@
 """
-neuromap - Configuration & Constants
-Defines standard 64-channel 10-05 montage, coordinate maps, stimulus events, and colormaps.
+neuromap - Configuration & Montage Specifications
+Targeted for 1920x1200 High-DPI Display | Dark Modern Theme
 """
+
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 import numpy as np
 
+# ==============================================================================
+# 64-CHANNEL 10-05 MONTAGE DEFINITION
+# ==============================================================================
 
-STANDARD_64_CHANNELS = [
+STANDARD_64_CHANNELS: List[str] = [
     'Fp1', 'Fpz', 'Fp2',
     'AF7', 'AF3', 'AFz', 'AF4', 'AF8',
     'F7', 'F5', 'F3', 'F1', 'Fz', 'F2', 'F4', 'F6', 'F8',
@@ -21,14 +25,16 @@ STANDARD_64_CHANNELS = [
     'Iz'
 ]
 
-PALETTE_COLORS = [
+# Distinct palette colors for individual channel traces (Spotify-esque dark neon)
+PALETTE_COLORS: List[str] = [
     '#1DB954', '#00E5FF', '#E040FB', '#FFD600', '#FF5252', '#69F0AE',
     '#448AFF', '#FF6E40', '#EEFF41', '#B388FF', '#18FFFF', '#FF4081',
     '#64FFDA', '#B2FF59', '#FFAB40', '#7C4DFF', '#00B0FF', '#FF5722',
     '#40C4FF', '#A7FFEB', '#FFD180', '#FF80AB', '#EA80FC', '#82B1FF'
 ]
 
-EVENT_COLOR_MAP = {
+# Stimulus event mapping (PhysioNet Motor Movement / Imagery: T0 Rest, T1 Left Fist, T2 Right Fist)
+EVENT_COLOR_MAP: Dict[str, Dict[str, str]] = {
     'T0': {'name': 'Rest', 'bg': '#1E2530', 'border': '#00E5FF', 'text': '#00E5FF', 'dot': '#00E5FF'},
     'T1': {'name': 'Left Fist', 'bg': '#0D332D', 'border': '#00FFA3', 'text': '#00FFA3', 'dot': '#00FFA3'},
     'T2': {'name': 'Right Fist', 'bg': '#331238', 'border': '#BA68C8', 'text': '#BA68C8', 'dot': '#BA68C8'}
@@ -43,7 +49,8 @@ class StimulusEvent:
     start_sample: int
     end_sample: int
 
-MONTAGE_2D_COORDS = {
+# Normalized 2D polar projection coordinates [-1.0, 1.0] for 64 electrodes
+MONTAGE_2D_COORDS: Dict[str, Tuple[float, float]] = {
     'Fp1': (-0.30, 0.85), 'Fpz': (0.00, 0.88), 'Fp2': (0.30, 0.85),
     'AF7': (-0.60, 0.70), 'AF3': (-0.35, 0.68), 'AFz': (0.00, 0.70), 'AF4': (0.35, 0.68), 'AF8': (0.60, 0.70),
     'F7': (-0.75, 0.50), 'F5': (-0.52, 0.48), 'F3': (-0.32, 0.47), 'F1': (-0.12, 0.46),
@@ -61,12 +68,25 @@ MONTAGE_2D_COORDS = {
     'O1': (-0.30, -0.85), 'Oz': (0.00, -0.88), 'O2': (0.30, -0.85), 'Iz': (0.00, -0.96)
 }
 
+# Key Sensorimotor Electrodes for ERSP and Motor Imagery BCI
+SENSORIMOTOR_CHANNELS: List[str] = ['C3', 'Cz', 'C4']
+
+# ==============================================================================
+# CANONICAL FREQUENCY BANDS (PHASE 5 ANALYTICS)
+# ==============================================================================
+
+FREQUENCY_BANDS: Dict[str, Tuple[float, float, str]] = {
+    'Delta': (1.0, 4.0, '#3A82F7'),     # 1-4 Hz (Deep blue)
+    'Theta': (4.0, 8.0, '#00E5FF'),     # 4-8 Hz (Cyan)
+    'Alpha': (8.0, 12.0, '#00FFA3'),    # 8-12 Hz (Spring green / Mu rhythm)
+    'Beta':  (12.0, 30.0, '#FFB300'),   # 12-30 Hz (Amber gold)
+    'Gamma': (30.0, 45.0, '#E040FB')    # 30-45 Hz (Electric purple)
+}
 
 # ==============================================================================
 # UNIFIED COLORMAP SPECIFICATION (2D & 3D PARITY)
 # ==============================================================================
-# Canonical Coolwarm Diverging Palette:
-# -V: Deep Blue (#1E88E5) -> Cyan (#00E5FF) -> Neutral 0V (#12151C) -> Coral (#FF6E40) -> +V: Crimson (#E53935)
+
 COLORMAP_STOPS = np.array([0.0, 0.25, 0.50, 0.75, 1.0], dtype=np.float32)
 COLORMAP_COLORS_RGBA = np.array([
     [30, 136, 229, 240],   # -V Deep Blue
@@ -76,18 +96,18 @@ COLORMAP_COLORS_RGBA = np.array([
     [229, 57, 53, 240]     # +V Deep Crimson Red
 ], dtype=np.float32)
 
-PYVISTA_CMAP = ['#1E88E5', '#00E5FF', '#12151C', '#FF6E40', '#E53935']
+PYVISTA_CMAP: List[str] = ['#1E88E5', '#00E5FF', '#12151C', '#FF6E40', '#E53935']
 
 def generate_unified_lut_256() -> np.ndarray:
+    """Precomputes a 256x4 RGBA uint8 lookup table for smooth 2D/3D colormapping."""
     lut = np.zeros((256, 4), dtype=np.uint8)
     for c in range(4):
-        lut[:, c] = np.interp(np.linspace(0, 1, 256), COLORMAP_STOPS, COLORMAP_COLORS_RGBA[:, c]).astype(np.uint8)
+        lut[:, c] = np.interp(
+            np.linspace(0, 1, 256), COLORMAP_STOPS, COLORMAP_COLORS_RGBA[:, c]
+        ).astype(np.uint8)
     return lut
 
-UNIFIED_LUT_256 = generate_unified_lut_256()
+UNIFIED_LUT_256: np.ndarray = generate_unified_lut_256()
 
-
-# ==============================================================================
-# CENTRALIZED CHANNEL STATE & CACHE MANAGERS
-# ==============================================================================
-
+# Connectivity Colormap stops (for Phase-Locking Value / Coherence arcs: Cyan -> Gold -> Crimson)
+CONNECTIVITY_LUT: List[str] = ['#1A2234', '#00E5FF', '#00FFA3', '#FFD600', '#FF3D00']

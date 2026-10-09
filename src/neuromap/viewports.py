@@ -1,24 +1,35 @@
 """
-neuromap - Topomap Viewports
-Includes:
-- TopomapColorbarWidget: Horizontal voltage colorbar
-- Topomap2DWidget: 2D scalp voltage topomap with smooth regularized IDW interpolation
-- Brain3DWidget: Cortical surface topomap with cold-standby rendering
-- TopomapContainerWidget: Viewport switcher with lazy 3D loading
+neuromap - Topographic Viewports Architecture (2D Topomap & 3D Cortical Brain)
+Targeted for 1920x1200 Display | High-DPI | Dark Modern Theme
+
+Components:
+- TopomapColorbarWidget: Horizontal voltage colorbar (µV) with unified coolwarm palette.
+- Topomap2DWidget: 128x128 regularized multiquadric interpolation, anti-aliased smoothstep boundary mask,
+  Phase 3 aesthetics, and Phase 5 Dynamic Neural Connectivity Arcs (PLV & Coherence).
+- Brain3DWidget: Anatomical cortical surface mesh (data/human-brain.glb), strict bilateral symmetry (Z <-> -Z),
+  midline longitudinal fissure bridge (Z = 0.0), outward surface normal offset (+0.055),
+  Phase 5 3D Cortical Connectivity Arcs, and cold-standby zero-overhead pause.
+- TopomapContainerWidget: QStackedWidget switching between 2D Topomap and 3D Brain with connectivity overlay controls.
 """
+
 import os
 import math
-from typing import List, Dict, Optional, Set
-
+from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
-from PyQt5.QtCore import Qt, QRectF, pyqtSignal
-from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QLinearGradient
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QPushButton,
-    QCheckBox, QStackedWidget
-)
-import pyqtgraph as pg
 
+# PyQt5 GUI Framework
+try:
+    from PyQt5.QtCore import Qt, pyqtSignal, QPointF, QRectF
+    from PyQt5.QtGui import QColor, QFont, QPen, QBrush, QPainter, QPolygonF
+    from PyQt5.QtWidgets import (
+        QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+        QCheckBox, QFrame, QStackedWidget, QSizePolicy
+    )
+    import pyqtgraph as pg
+except ImportError:
+    pass
+
+# PyVista 3D Visualization
 try:
     import pyvista as pv
     from pyvistaqt import QtInteractor
@@ -26,26 +37,27 @@ try:
 except ImportError:
     PYVISTA_AVAILABLE = False
 
-try:
-    from .config import MONTAGE_2D_COORDS, UNIFIED_LUT_256, PYVISTA_CMAP
-    from .engine import EEGDataLoader
-except ImportError:
-    from config import MONTAGE_2D_COORDS, UNIFIED_LUT_256, PYVISTA_CMAP
-    from engine import EEGDataLoader
+from config import (
+    STANDARD_64_CHANNELS, MONTAGE_2D_COORDS, UNIFIED_LUT_256, PYVISTA_CMAP
+)
+from engine import EEGDataLoader
+
+
+# ==============================================================================
+# VOLTAGE COLORBAR DOCK WIDGET (-V to +V µV)
+# ==============================================================================
 
 class TopomapColorbarWidget(QWidget):
     """
-    Sleek Horizontal Voltage Colorbar for 2D Topomap:
-    - Features clean title: 'Voltage (µV)'
-    - Renders exact gradient using UNIFIED_COLORMAP stops (-V Blue -> Cyan -> Dark -> Coral -> +V Red)
-    - Dynamically updates tick values (-V, 0.0, +V) in sync with Topomap Limit slider.
+    Dedicated Horizontal Voltage Colorbar:
+    - Sits cleanly below 2D topomap.
+    - Accurately indicates voltage range (-V to +V µV).
     """
     def __init__(self, v_scale: float = 50.0, parent=None):
         super().__init__(parent)
         self.v_scale = v_scale
-        self.setFixedHeight(30)
-        self.setFixedWidth(240)
-        self.setStyleSheet("background: transparent;")
+        self.setFixedHeight(26)
+        self.setMinimumWidth(220)
 
     def set_v_scale(self, v_scale: float):
         self.v_scale = v_scale
@@ -57,53 +69,55 @@ class TopomapColorbarWidget(QWidget):
 
         w = self.width()
         h = self.height()
+        bar_w = int(w * 0.75)
+        bar_h = 8
+        bar_x = (w - bar_w) // 2
+        bar_y = 4
 
-        # Title: Voltage (µV)
-        painter.setFont(QFont("Segoe UI", 7, QFont.Bold))
-        painter.setPen(QColor("#8C9BAE"))
-        painter.drawText(QRectF(0, 0, w, 11), Qt.AlignCenter, "Voltage (µV)")
+        # Draw segmented color blocks from UNIFIED_LUT_256
+        n_steps = 64
+        step_w = bar_w / float(n_steps)
+        for i in range(n_steps):
+            lut_idx = int((i / float(n_steps)) * 255)
+            r, g, b, a = UNIFIED_LUT_256[lut_idx]
+            painter.fillRect(
+                QRectF(bar_x + i * step_w, bar_y, step_w + 1.0, bar_h),
+                QColor(int(r), int(g), int(b))
+            )
 
-        # Gradient Bar
-        bar_x = 10
-        bar_y = 12
-        bar_w = w - 20
-        bar_h = 6
+        painter.setPen(QPen(QColor('#323C4E'), 1))
+        painter.drawRect(bar_x, bar_y, bar_w, bar_h)
 
-        gradient = QLinearGradient(bar_x, bar_y, bar_x + bar_w, bar_y)
-        gradient.setColorAt(0.0, QColor(30, 136, 229))   # -V Blue
-        gradient.setColorAt(0.25, QColor(0, 229, 255))   # Cyan
-        gradient.setColorAt(0.50, QColor(18, 21, 28))    # 0V Neutral Dark
-        gradient.setColorAt(0.75, QColor(255, 110, 64))  # Coral Orange
-        gradient.setColorAt(1.0, QColor(229, 57, 53))    # +V Crimson Red
-
-        painter.setBrush(QBrush(gradient))
-        painter.setPen(QPen(QColor("#252D3C"), 1))
-        painter.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 2, 2)
-
-        # Tick Labels
+        # Labels
+        painter.setPen(QPen(QColor('#8C9BAE'), 1))
         painter.setFont(QFont("Consolas", 8, QFont.Bold))
-        painter.setPen(QColor("#A0AEC0"))
-        painter.drawText(QRectF(bar_x, bar_y + bar_h + 1, 60, 11), Qt.AlignLeft, f"-{self.v_scale:.0f}")
-        painter.drawText(QRectF(bar_x + (bar_w // 2) - 25, bar_y + bar_h + 1, 50, 11), Qt.AlignCenter, "0")
-        painter.drawText(QRectF(bar_x + bar_w - 60, bar_y + bar_h + 1, 60, 11), Qt.AlignRight, f"+{self.v_scale:.0f}")
 
+        painter.drawText(bar_x - 38, bar_y + bar_h, f"-{self.v_scale:.0f}µV")
+        painter.drawText(bar_x + bar_w + 6, bar_y + bar_h, f"+{self.v_scale:.0f}µV")
+        painter.drawText(bar_x + (bar_w // 2) - 8, bar_y + bar_h + 10, "0")
+
+
+# ==============================================================================
+# 2D VOLTAGE TOPOMAP (WITH PHASE 5 NEURAL CONNECTIVITY ARCS)
+# ==============================================================================
 
 class Topomap2DWidget(QWidget):
     """
     2D Voltage Topographic Map:
-    - High-Resolution (128x128) Regularized Multiquadric Interpolation for smooth gradients.
+    - High-Resolution (128x128) Regularized Multiquadric Interpolation.
     - Anti-aliased smoothstep circular alpha mask eliminating pixel staircase edges.
-    - Phase 3 aesthetics restored:
+    - Clean Phase 3 aesthetics:
       * NO filled-in grey background (100% transparent outside & inside).
       * NO circular borders/dots around unselected electrode points (crisp white text labels only).
       * Selected channels feature prominent circular badges with white border.
       * Upward-pointing green triangle nose and crisp white head/ear outlines.
-    - Integrated dynamic Voltage Colorbar dock at bottom center.
+    - Phase 5: Dynamic Neural Connectivity Arcs (PLV & Spectral Coherence).
     """
     def __init__(self, data_loader: EEGDataLoader, parent=None):
         super().__init__(parent)
         self.data_loader = data_loader
         self.v_scale = 50.0
+        self.show_connectivity = False
 
         # Retrieve cached interpolation structures
         self.cache = self.data_loader.interpolation_cache
@@ -111,6 +125,8 @@ class Topomap2DWidget(QWidget):
         self.idw_matrix = self.cache.idw_2d_matrix
         self.alpha_mask = self.cache.alpha_mask_2d
         self.valid_ch_names = self.cache.valid_ch_names_2d
+
+        self.connectivity_curve_items: List[pg.PlotCurveItem] = []
 
         self._init_ui()
 
@@ -208,7 +224,7 @@ class Topomap2DWidget(QWidget):
         self.colorbar.set_v_scale(v_scale)
 
     def update_voltage_frame(self, sample_idx: int):
-        voltages = self.data_loader.filtered_data[:len(self.valid_ch_names), sample_idx]
+        voltages = self.data_loader.get_channel_voltages(sample_idx)[:len(self.valid_ch_names)]
         grid_flat = np.dot(self.idw_matrix, voltages)
         v_norm = np.clip((grid_flat + self.v_scale) / (2.0 * self.v_scale), 0.0, 1.0)
         idx = (v_norm * 255.0).astype(np.uint8)
@@ -219,6 +235,59 @@ class Topomap2DWidget(QWidget):
 
         self.img_item.setImage(rgba, autoLevels=False)
         self.img_item.setRect(QRectF(-1.05, -1.05, 2.1, 2.1))
+
+    # --------------------------------------------------------------------------
+    # PHASE 5: DYNAMIC NEURAL CONNECTIVITY ARCS (2D)
+    # --------------------------------------------------------------------------
+    def set_connectivity_edges(self, edges: List[Tuple[str, str, float, Tuple[float, float], Tuple[float, float]]]):
+        """Renders curved neural connectivity arcs across the 2D topomap array."""
+        # Clear previous curves
+        for item in self.connectivity_curve_items:
+            self.plot_widget.removeItem(item)
+        self.connectivity_curve_items.clear()
+
+        if not self.show_connectivity or len(edges) == 0:
+            return
+
+        for ch1, ch2, strength, p1, p2 in edges:
+            x1, y1 = p1
+            x2, y2 = p2
+
+            # Compute quadratic Bezier arc curved slightly towards center or outward
+            t = np.linspace(0.0, 1.0, 30)
+            mid_x = (x1 + x2) / 2.0
+            mid_y = (y1 + y2) / 2.0
+            # Arc bend normal
+            dx = x2 - x1
+            dy = y2 - y1
+            dist = math.sqrt(dx**2 + dy**2)
+            ctrl_x = mid_x - dy * 0.22
+            ctrl_y = mid_y + dx * 0.22
+
+            arc_x = (1 - t)**2 * x1 + 2 * (1 - t) * t * ctrl_x + t**2 * x2
+            arc_y = (1 - t)**2 * y1 + 2 * (1 - t) * t * ctrl_y + t**2 * y2
+
+            # Color and Alpha proportional to strength (Cyan to Gold)
+            alpha_val = int(min(240, max(60, strength * 255)))
+            if strength > 0.80:
+                color = QColor(255, 214, 0, alpha_val)  # Gold
+                width = 2.4
+            else:
+                color = QColor(0, 229, 255, alpha_val)  # Cyan
+                width = 1.6
+
+            pen = pg.mkPen(color, width=width)
+            curve = pg.PlotCurveItem(arc_x, arc_y, pen=pen)
+            curve.setZValue(8)  # Under electrodes, above heatmap
+            self.plot_widget.addItem(curve)
+            self.connectivity_curve_items.append(curve)
+
+    def set_connectivity_visible(self, visible: bool):
+        self.show_connectivity = visible
+        if not visible:
+            for item in self.connectivity_curve_items:
+                self.plot_widget.removeItem(item)
+            self.connectivity_curve_items.clear()
 
     def _on_electrode_clicked(self, item, points):
         if len(points) == 0:
@@ -257,12 +326,12 @@ class Topomap2DWidget(QWidget):
 
 
 # ==============================================================================
-# PHASE 4: 3D CORTICAL TOPOMAP (COLD-STANDBY & RIGOROUS SURFACE PINNING)
+# 3D CORTICAL TOPOMAP (WITH PHASE 5 3D NEURAL CONNECTIVITY ARCS)
 # ==============================================================================
 
 class Brain3DWidget(QWidget):
     """
-    Phase 4: 3D Topographic Heat Map Engine:
+    3D Topographic Heat Map Engine:
     - Renders data/human-brain.glb (or procedural cortical surface).
     - Decimates mesh (~3,500 vertices) for 60+ FPS rendering.
     - True Anatomical Electrode Placement:
@@ -270,9 +339,9 @@ class Brain3DWidget(QWidget):
       * Strict bilateral symmetry (Z <-> -Z) for all 27 pairs.
       * Strict midline pinning (Z = 0.0) bridging the longitudinal fissure.
       * Surface normal / radial outward offset (+0.055) ensuring spheres are pinned to the exterior.
+    - Phase 5: 3D Cortical Functional Connectivity Arcs (PLV / Coherence).
     - Cold-Standby Optimization:
       * Fully stops VTK rendering and IDW math when unselected or dissolved.
-      * Disabling electrodes hides both base spheres and selection halos.
     """
     def __init__(self, data_loader: EEGDataLoader, parent=None):
         super().__init__(parent)
@@ -285,11 +354,13 @@ class Brain3DWidget(QWidget):
         self.elec_actor = None
         self.highlight_actor = None
         self.scalar_bar_actor = None
+        self.conn_3d_actor = None
         self.pts_per_sphere = 1
 
         self.show_heatmap = True
         self.show_electrodes = True
         self.show_scalar_bar = False
+        self.show_connectivity_3d = False
         self.clim = [-50.0, 50.0]
 
         self._init_ui()
@@ -433,7 +504,6 @@ class Brain3DWidget(QWidget):
         )
 
     def _precompute_3d_idw(self):
-        """Precomputes 3D IDW Matrix and caches on SharedInterpolationCache."""
         cache = self.data_loader.interpolation_cache
         if cache.idw_3d_matrix is not None:
             self.idw_3d_matrix = cache.idw_3d_matrix
@@ -530,7 +600,6 @@ class Brain3DWidget(QWidget):
         weights /= np.sum(weights, axis=1, keepdims=True)
         self.idw_3d_matrix = weights.astype(np.float32)
 
-        # Store in shared cache
         cache.idw_3d_matrix = self.idw_3d_matrix
         cache.elec_coords_3d = self.elec_coord_dict
         cache.valid_ch_names_3d = self.valid_ch_names
@@ -558,7 +627,6 @@ class Brain3DWidget(QWidget):
         )
 
     def reset_camera_view(self):
-        """Top-down superior view looking straight down (+Y down), frontal cortex (+X) up."""
         if not PYVISTA_AVAILABLE or self.plotter is None:
             return
         self.plotter.camera_position = [(0.0, 5.6, 0.0), (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)]
@@ -578,6 +646,51 @@ class Brain3DWidget(QWidget):
             self.elec_mesh['voltage'] = expanded_v
 
         self.plotter.render()
+
+    # --------------------------------------------------------------------------
+    # PHASE 5: 3D DYNAMIC NEURAL CONNECTIVITY ARCS
+    # --------------------------------------------------------------------------
+    def update_connectivity_3d(self, edges: List[Tuple[str, str, float, Tuple[float, float], Tuple[float, float]]]):
+        if not self.is_active or not PYVISTA_AVAILABLE or self.plotter is None:
+            return
+
+        if self.conn_3d_actor is not None:
+            self.plotter.remove_actor(self.conn_3d_actor)
+            self.conn_3d_actor = None
+
+        if not self.show_connectivity_3d or len(edges) == 0:
+            return
+
+        lines = []
+        for ch1, ch2, strength, _, _ in edges:
+            if ch1 in self.elec_coord_dict and ch2 in self.elec_coord_dict:
+                p1 = self.elec_coord_dict[ch1]
+                p2 = self.elec_coord_dict[ch2]
+                # Slight outward bulge to float above cortex
+                mid = (p1 + p2) / 2.0 * 1.12
+                # Create 3-point spline
+                spline = pv.Spline(np.vstack([p1, mid, p2]), n_points=12)
+                lines.append(spline)
+
+        if len(lines) > 0:
+            multi_lines = lines[0]
+            for l in lines[1:]:
+                multi_lines = multi_lines.merge(l)
+            self.conn_3d_actor = self.plotter.add_mesh(
+                multi_lines,
+                color='#00FFA3',
+                line_width=2.5,
+                lighting=False
+            )
+            self.plotter.render()
+
+    def set_connectivity_visible(self, visible: bool):
+        self.show_connectivity_3d = visible
+        if not visible and self.conn_3d_actor is not None:
+            self.plotter.remove_actor(self.conn_3d_actor)
+            self.conn_3d_actor = None
+            if self.is_active:
+                self.plotter.render()
 
     def set_clim(self, v_scale: float):
         self.clim = [-float(v_scale), float(v_scale)]
@@ -663,7 +776,7 @@ class Brain3DWidget(QWidget):
 
 
 # ==============================================================================
-# TOPOMAP CONTAINER (TOGGLEABLE 2D MAP / 3D BRAIN WITH ZERO BACKGROUND OVERHEAD)
+# TOPOMAP CONTAINER (SWITCHABLE 2D / 3D WITH CONNECTIVITY CONTROLS)
 # ==============================================================================
 
 class TopomapContainerWidget(QWidget):
@@ -671,7 +784,7 @@ class TopomapContainerWidget(QWidget):
     Unified Topomap Viewport:
     - Hosts a QStackedWidget switching between Page 0 (2D Topomap) and Page 1 (3D Brain).
     - Segmented Mode Selector: [ 2D Topomap ] | [ 3D Brain ].
-    - Lazy 3D Initialization: 3D engine is only allocated upon first click of [3D Brain].
+    - Phase 5: Functional Neural Connectivity Arcs Toggle Checkbox.
     - Zero background overhead: When 2D is active, 3D engine is completely stopped.
     """
     mode_changed = pyqtSignal(str)
@@ -689,14 +802,88 @@ class TopomapContainerWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Header Bar matching reference
-        header = QFrame()
-        header.setFixedHeight(34)
-        header.setStyleSheet("""
+        # Top Control Bar
+        toolbar = QFrame()
+        toolbar.setFixedHeight(36)
+        toolbar.setStyleSheet("""
             QFrame {
-                background: #0B0C10;
-                border-bottom: 1px solid #1A1F2C;
+                background: #060709;
+                border-bottom: 1px solid #14171E;
             }
+        """)
+        tb_layout = QHBoxLayout(toolbar)
+        tb_layout.setContentsMargins(12, 2, 12, 2)
+        tb_layout.setSpacing(10)
+
+        # Segmented Control: [ 2D Topomap ] | [ 3D Brain ]
+        seg_frame = QFrame()
+        seg_frame.setFixedHeight(26)
+        seg_frame.setStyleSheet("""
+            QFrame {
+                background: #10131B;
+                border: 1px solid #1E2533;
+                border-radius: 4px;
+            }
+        """)
+        seg_layout = QHBoxLayout(seg_frame)
+        seg_layout.setContentsMargins(2, 2, 2, 2)
+        seg_layout.setSpacing(2)
+
+        self.btn_2d = QPushButton("2D Topomap")
+        self.btn_2d.setFixedHeight(22)
+        self.btn_2d.setFocusPolicy(Qt.NoFocus)
+        self.btn_2d.clicked.connect(lambda: self.set_mode("2D"))
+        seg_layout.addWidget(self.btn_2d)
+
+        self.btn_3d = QPushButton("3D Brain")
+        self.btn_3d.setFixedHeight(22)
+        self.btn_3d.setFocusPolicy(Qt.NoFocus)
+        self.btn_3d.clicked.connect(lambda: self.set_mode("3D"))
+        seg_layout.addWidget(self.btn_3d)
+
+        tb_layout.addWidget(seg_frame)
+
+        # Phase 5: Connectivity Arcs Overlay Checkbox
+        self.chk_conn_arcs = QCheckBox("Neural Arcs")
+        self.chk_conn_arcs.setToolTip("Overlay dynamic functional connectivity arcs (PLV / Coherence)")
+        self.chk_conn_arcs.setChecked(False)
+        self.chk_conn_arcs.toggled.connect(self._on_toggle_connectivity_arcs)
+        self.chk_conn_arcs.setStyleSheet("color: #00FFA3; font-size: 10px; font-weight: bold;")
+        tb_layout.addWidget(self.chk_conn_arcs)
+
+        tb_layout.addStretch()
+
+        # Active Channel Badge
+        self.active_badge = QLabel("0 Active")
+        self.active_badge.setStyleSheet("""
+            background: #14221D;
+            color: #00FFA3;
+            border: 1px solid #00FFA3;
+            border-radius: 3px;
+            font-size: 9px;
+            font-weight: bold;
+            padding: 2px 6px;
+        """)
+        tb_layout.addWidget(self.active_badge)
+
+        btn_select_all = QPushButton("Select All")
+        btn_select_all.setStyleSheet("""
+            QPushButton {
+                background: #14171E;
+                color: #DDE2EB;
+                border: 1px solid #232B3B;
+                border-radius: 3px;
+                padding: 3px 8px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #1F2737; }
+        """)
+        btn_select_all.clicked.connect(self._on_select_all)
+        tb_layout.addWidget(btn_select_all)
+
+        btn_clear = QPushButton("Clear")
+        btn_clear.setStyleSheet("""
             QPushButton {
                 background: #14171E;
                 color: #8C9BAE;
@@ -706,66 +893,18 @@ class TopomapContainerWidget(QWidget):
                 font-size: 10px;
                 font-weight: bold;
             }
-            QPushButton:hover {
-                background: #1E2431;
-                color: #E2E8F0;
-            }
+            QPushButton:hover { background: #1F2737; color: #FFFFFF; }
         """)
-        h_layout = QHBoxLayout(header)
-        h_layout.setContentsMargins(10, 2, 10, 2)
-        h_layout.setSpacing(8)
+        btn_clear.clicked.connect(self._on_clear)
+        tb_layout.addWidget(btn_clear)
 
-        self.title_lbl = QLabel("2D VOLTAGE TOPOMAP (64 CHANNELS)")
-        self.title_lbl.setStyleSheet("color: #E2E8F0; font-size: 10px; font-weight: bold; letter-spacing: 0.5px;")
-        h_layout.addWidget(self.title_lbl)
+        layout.addWidget(toolbar)
 
-        # Active channels badge
-        self.active_badge = QLabel("0 / 64 Active")
-        self.active_badge.setStyleSheet("""
-            background: #0D332D;
-            color: #00FFA3;
-            border: 1px solid #00FFA3;
-            border-radius: 9px;
-            padding: 2px 8px;
-            font-size: 10px;
-            font-weight: bold;
-        """)
-        h_layout.addWidget(self.active_badge)
-
-        h_layout.addStretch()
-
-        # [Select All] and [Clear] buttons
-        self.btn_select_all = QPushButton("Select All")
-        self.btn_clear = QPushButton("Clear")
-        self.btn_select_all.clicked.connect(self._on_select_all)
-        self.btn_clear.clicked.connect(self._on_clear)
-        h_layout.addWidget(self.btn_select_all)
-        h_layout.addWidget(self.btn_clear)
-
-        # Segmented Mode Switcher
-        self.btn_2d = QPushButton("2D Topomap")
-        self.btn_3d = QPushButton("3D Brain")
-        self.btn_2d.clicked.connect(lambda: self.set_mode("2D"))
-        self.btn_3d.clicked.connect(lambda: self.set_mode("3D"))
-
-        h_layout.addWidget(self.btn_2d)
-        h_layout.addWidget(self.btn_3d)
-
-        layout.addWidget(header)
-
-        # Stacked Widget
+        # Stacked Viewports (2D on Page 0, 3D on Page 1)
         self.stack = QStackedWidget()
-        self.widget_2d = Topomap2DWidget(self.data_loader, self)
-        self.stack.addWidget(self.widget_2d)  # Index 0
 
-        # Placeholder for lazy 3D loading (Index 1)
-        self.placeholder_3d = QWidget()
-        p_layout = QVBoxLayout(self.placeholder_3d)
-        p_lbl = QLabel("Click [3D Brain] to initialize 3D Cortical Engine...")
-        p_lbl.setAlignment(Qt.AlignCenter)
-        p_lbl.setStyleSheet("color: #4A5568; font-size: 11px;")
-        p_layout.addWidget(p_lbl)
-        self.stack.addWidget(self.placeholder_3d)
+        self.widget_2d = Topomap2DWidget(self.data_loader, self)
+        self.stack.addWidget(self.widget_2d)
 
         layout.addWidget(self.stack, stretch=1)
         self._refresh_button_styles()
@@ -773,35 +912,40 @@ class TopomapContainerWidget(QWidget):
     def set_mode(self, mode: str):
         if mode == self.current_mode:
             return
-        self.current_mode = mode
 
+        self.current_mode = mode
         if mode == "2D":
             self.stack.setCurrentIndex(0)
-            self.title_lbl.setText("2D VOLTAGE TOPOMAP (64 CHANNELS)")
-            self.btn_select_all.setVisible(True)
-            self.btn_clear.setVisible(True)
             if self.widget_3d is not None:
                 self.widget_3d.pause_engine()
-        else:
+        elif mode == "3D":
             if self.widget_3d is None:
-                print("[INFO] Cold-starting 3D Cortical Engine...")
+                print("[INFO] Lazy-initializing 3D Cortical Viewport...")
                 self.widget_3d = Brain3DWidget(self.data_loader, self)
-                self.stack.removeWidget(self.placeholder_3d)
                 self.stack.addWidget(self.widget_3d)
-                self.widget_3d.set_selected_channels(self.data_loader.channel_state.selected_channels)
                 self.widget_3d.set_clim(self.widget_2d.v_scale)
+                self.widget_3d.set_selected_channels(self.data_loader.channel_state.selected_channels)
+                self.widget_3d.set_connectivity_visible(self.chk_conn_arcs.isChecked())
 
             self.stack.setCurrentIndex(1)
-            self.title_lbl.setText("3D CORTICAL TOPOMAP (PHASE 4 ENGINE)")
-            self.btn_select_all.setVisible(False)
-            self.btn_clear.setVisible(False)
             self.widget_3d.resume_engine()
 
         self._refresh_button_styles()
-        self.mode_changed.emit(self.current_mode)
+        self.mode_changed.emit(mode)
+
+    def _on_toggle_connectivity_arcs(self, checked: bool):
+        self.widget_2d.set_connectivity_visible(checked)
+        if self.widget_3d is not None:
+            self.widget_3d.set_connectivity_visible(checked)
+
+    def update_connectivity_arcs(self, edges: List[Tuple[str, str, float, Tuple[float, float], Tuple[float, float]]]):
+        if self.current_mode == "2D":
+            self.widget_2d.set_connectivity_edges(edges)
+        elif self.current_mode == "3D" and self.widget_3d is not None and self.widget_3d.is_active:
+            self.widget_3d.update_connectivity_3d(edges)
 
     def update_active_badge(self, count: int):
-        self.active_badge.setText(f"{count} / 64 Active")
+        self.active_badge.setText(f"{count} Active")
 
     def _on_select_all(self):
         self.data_loader.channel_state.select_all()
@@ -811,28 +955,34 @@ class TopomapContainerWidget(QWidget):
 
     def _refresh_button_styles(self):
         active_style = """
-            background: #1B2B24;
-            color: #00FFA3;
-            border: 1px solid #00FFA3;
-            border-radius: 3px;
-            padding: 3px 10px;
-            font-size: 10px;
-            font-weight: bold;
+            QPushButton {
+                background: #1DB954;
+                color: #000000;
+                font-weight: bold;
+                border-radius: 3px;
+                border: none;
+                padding: 2px 10px;
+                font-size: 10px;
+            }
         """
         inactive_style = """
-            background: #14171E;
-            color: #8C9BAE;
-            border: 1px solid #232B3B;
-            border-radius: 3px;
-            padding: 3px 10px;
-            font-size: 10px;
-            font-weight: bold;
+            QPushButton {
+                background: transparent;
+                color: #8C9BAE;
+                font-weight: bold;
+                border-radius: 3px;
+                border: none;
+                padding: 2px 10px;
+                font-size: 10px;
+            }
+            QPushButton:hover {
+                color: #FFFFFF;
+                background: #181E2B;
+            }
         """
-        self.btn_2d.setStyleSheet(active_style if self.current_mode == "2D" else inactive_style)
-        self.btn_3d.setStyleSheet(active_style if self.current_mode == "3D" else inactive_style)
-
-
-# ==============================================================================
-# CASCADING WAVEFORMS WIDGET (PHASE 4.03 SLIDING WINDOW)
-# ==============================================================================
-
+        if self.current_mode == "2D":
+            self.btn_2d.setStyleSheet(active_style)
+            self.btn_3d.setStyleSheet(inactive_style)
+        else:
+            self.btn_2d.setStyleSheet(inactive_style)
+            self.btn_3d.setStyleSheet(active_style)

@@ -1,22 +1,51 @@
 """
-neuromap - Closed-Loop Signal Processing & Playback Engine
-Includes:
-- CentralizedChannelState: Unified channel multi-selection
-- SharedInterpolationCache: Shared 2D/3D IDW matrices
-- EEGDataLoader: Streaming ingestion, DSP filters, FastICA spatial filter, Phase 4.03 sliding window
-- PlaybackEngine: High-precision wall-clock playback ticker & frame-by-frame stepping
+neuromap - Core Engine Architecture
+Targeted for 1920x1200 Display | High-DPI | Dark Modern Theme
+
+Components:
+- CentralizedChannelState: Single source of truth for channel multi-selection across all views.
+- SharedInterpolationCache: Precomputed 128x128 2D regularized multiquadric IDW matrix & anti-aliased edge mask.
+- EEGDataLoader: Closed-loop streaming data loader with real-time FastICA & ASR spatial projection (P = A_clean @ W),
+  Phase 4.03 standard sliding window slicing with np.hstack edge padding, and integrated Phase 5 Analytical Engines.
+- LSLReceiverThread: LabStreamingLayer (pylsl) live hardware stream receiver inlet for plug-and-play EEG headsets.
+- PlaybackEngine: High-precision wall-clock ticker with frame-by-frame stepping (1 sample = 6.25ms @ 160Hz).
 """
+
+import os
 import time
 import math
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set
 
 import numpy as np
 import scipy.signal
 
-from PyQt5.QtCore import QObject, pyqtSignal, QTimer
+# PyQt5 Core
+try:
+    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
+except ImportError:
+    # Graceful dummy classes for headless/compile testing on environments without PyQt5
+    class QObject:
+        def __init__(self, *args, **kwargs): pass
+    class QThread(QObject):
+        def __init__(self, *args, **kwargs): super().__init__()
+        def start(self): pass
+        def wait(self, *args): pass
+    def pyqtSignal(*args, **kwargs):
+        class _Signal:
+            def connect(self, slot): pass
+            def emit(self, *args, **kwargs): pass
+        return _Signal()
+    class _QtMock:
+        pass
+    Qt = _QtMock()
+    class QTimer:
+        def __init__(self): self.timeout = pyqtSignal()
+        def setInterval(self, val): pass
+        def start(self): pass
+        def stop(self): pass
 
-# MNE-Python
+# MNE-Python for real neurophysiology data
 try:
     import mne
     from mne.datasets import eegbci
@@ -24,20 +53,28 @@ try:
 except ImportError:
     MNE_AVAILABLE = False
 
+# LabStreamingLayer for live EEG hardware streaming
 try:
-    from .config import (
-        STANDARD_64_CHANNELS, PALETTE_COLORS, StimulusEvent,
-        EVENT_COLOR_MAP, MONTAGE_2D_COORDS
-    )
+    import pylsl
+    LSL_AVAILABLE = True
 except ImportError:
-    from config import (
-        STANDARD_64_CHANNELS, PALETTE_COLORS, StimulusEvent,
-        EVENT_COLOR_MAP, MONTAGE_2D_COORDS
-    )
+    LSL_AVAILABLE = False
+
+from config import (
+    STANDARD_64_CHANNELS, PALETTE_COLORS, EVENT_COLOR_MAP,
+    MONTAGE_2D_COORDS, StimulusEvent, SENSORIMOTOR_CHANNELS,
+    FREQUENCY_BANDS
+)
+import analytics
+
+
+# ==============================================================================
+# CENTRALIZED CHANNEL STATE (SINGLE SOURCE OF TRUTH)
+# ==============================================================================
 
 class CentralizedChannelState(QObject):
     """
-    Phase 4.02 Centralized Channel State:
+    Centralized Channel State:
     Single source of truth for channel activation across 2D Topomap, 3D Brain,
     Cascading Waveforms, and Header Badges.
     """
@@ -74,9 +111,13 @@ class CentralizedChannelState(QObject):
         return len(self.selected_channels)
 
 
+# ==============================================================================
+# SHARED INTERPOLATION CACHE (2D & 3D GEOMETRIC CACHES)
+# ==============================================================================
+
 class SharedInterpolationCache:
     """
-    Phase 4.02 Shared Interpolation Matrix Cache:
+    Shared Interpolation Matrix Cache:
     Precomputes high-resolution (128x128) 2D smooth regularized IDW matrix and
     anti-aliased circular alpha mask at application startup.
     Also caches 3D IDW matrix upon first computation.
@@ -120,7 +161,7 @@ class SharedInterpolationCache:
 
 
 # ==============================================================================
-# DATA LOADER & SIGNAL PROCESSING (FASTICA & ASR ENGINES)
+# DATA STRUCTURES FOR FASTICA ARTIFACT WORKSTATION
 # ==============================================================================
 
 @dataclass
@@ -135,6 +176,10 @@ class IndependentComponentInfo:
     is_rejected: bool = False
 
 
+# ==============================================================================
+# CLOSED-LOOP EEG DATA LOADER
+# ==============================================================================
+
 class EEGDataLoader(QObject):
     """
     Closed-Loop EEG Data Engine:
@@ -143,8 +188,10 @@ class EEGDataLoader(QObject):
     - Dynamic FastICA Spatial Decomposition & Online Rejection Projection Engine (P = A_clean @ W).
     - Artifact Subspace Reconstruction (ASR) burst filter.
     - Phase 4.03 standard array window slicing with edge padding (no pre-padded zero-copy circular ring buffer).
+    - Integrated Phase 5 Advanced Analytical Engines (PSD, ERSP, Connectivity, BCI Decoder).
     """
     data_reconstructed = pyqtSignal()
+    live_chunk_ingested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -185,6 +232,14 @@ class EEGDataLoader(QObject):
         self.interpolation_cache = SharedInterpolationCache(self.channel_names)
         self.gfp_envelope: Optional[np.ndarray] = None
 
+        # Phase 5: BCI Motor Imagery Decoder Pipeline
+        self.bci_pipeline = analytics.BCIDecoderPipeline(sfreq=self.sfreq)
+        
+        # Real-time connectivity cache (to avoid recomputing expensive matrices every single tick)
+        self._cached_conn_sample: int = -1
+        self._cached_plv_matrix: Optional[np.ndarray] = None
+        self._cached_coherence_matrix: Optional[np.ndarray] = None
+
     def load_dataset(self) -> bool:
         if MNE_AVAILABLE:
             try:
@@ -212,7 +267,7 @@ class EEGDataLoader(QObject):
                         pad_ch = np.zeros((64 - data.shape[0], data.shape[1]), dtype=data.dtype)
                         data = np.vstack([data, pad_ch])
                     
-                    self.raw_data = data[:64, :] * 1e6
+                    self.raw_data = data[:64, :].astype(np.float32) * 1e6
                     self.sfreq = float(raw.info['sfreq'])
                     self.n_channels, self.n_samples = self.raw_data.shape
                     self.duration = self.n_samples / self.sfreq
@@ -237,12 +292,14 @@ class EEGDataLoader(QObject):
 
                     print(f"[SUCCESS] Loaded {self.n_channels} channels, {self.n_samples} samples ({self.duration:.1f}s @ {self.sfreq:.0f}Hz).")
                     self.apply_dsp_filters()
+                    self.bci_pipeline.calibrate(self.filtered_data, self.events)
                     return True
             except Exception as e:
                 print(f"[WARN] MNE loading failed ({e}). Falling back to procedural 64-channel EEG.")
 
         self._generate_procedural_eeg()
         self.apply_dsp_filters()
+        self.bci_pipeline.calibrate(self.filtered_data, self.events)
         return True
 
     def _generate_procedural_eeg(self):
@@ -252,7 +309,7 @@ class EEGDataLoader(QObject):
         self.n_channels = 64
         self.channel_names = STANDARD_64_CHANNELS.copy()
 
-        t = np.linspace(0, self.duration, self.n_samples, endpoint=False)
+        t = np.linspace(0, self.duration, self.n_samples, endpoint=False, dtype=np.float32)
         self.raw_data = np.zeros((self.n_channels, self.n_samples), dtype=np.float32)
 
         for i in range(self.n_channels):
@@ -328,11 +385,6 @@ class EEGDataLoader(QObject):
             idx += 1
 
     def apply_dsp_filters(self, l_freq: float = 1.0, h_freq: float = 40.0, notch_freq: float = 60.0):
-        """
-        Initializes real-time filter coefficients and applies initial streaming bandpass/notch filtering.
-        NOTE: Heavy spatial decompositions (FastICA, ASR) are NOT run here; they execute on-demand
-        in the closed loop to ensure instantaneous application startup.
-        """
         print(f"[INFO] Initializing Stream DSP Filters: Bandpass [{l_freq}-{h_freq} Hz], Notch [{notch_freq} Hz]...")
         self.filtered_data = np.zeros_like(self.raw_data)
         nyq = 0.5 * self.sfreq
@@ -344,16 +396,13 @@ class EEGDataLoader(QObject):
         w0 = notch_freq / nyq
         b_notch, a_notch = scipy.signal.iirnotch(w0, 30.0)
 
-        # Fast vectorized filtering across channels
         s_bp = scipy.signal.filtfilt(b_band, a_band, self.raw_data, axis=-1)
         self.filtered_data = scipy.signal.filtfilt(b_notch, a_notch, s_bp, axis=-1).astype(np.float32)
         self.base_filtered_data = self.filtered_data.copy()
 
-        # Compute timeline waveform mini-map envelope (<15ms)
         self._compute_gfp_envelope()
 
     def get_active_data(self) -> np.ndarray:
-        """Returns the active data buffer: cleaned (if ICA/ASR active), base filtered, or raw."""
         if (self.ica_enabled or self.asr_enabled) and self.clean_data is not None:
             return self.clean_data
         if self.filtered_data is not None:
@@ -361,11 +410,6 @@ class EEGDataLoader(QObject):
         return self.raw_data
 
     def get_window_data(self, channel_idx: int, current_sample: int, n_samples: int) -> np.ndarray:
-        """
-        Phase 4.03 Standard Sliding Window:
-        Retrieves an n_samples window ending at current_sample.
-        Left-pads with the initial sample value using np.hstack if current_sample < n_samples.
-        """
         data = self.get_active_data()
         if data is None or current_sample <= 0:
             return np.zeros(n_samples, dtype=np.float32)
@@ -380,18 +424,12 @@ class EEGDataLoader(QObject):
             return data[channel_idx, start_idx:current_sample]
 
     def get_channel_voltages(self, sample_idx: int) -> np.ndarray:
-        """Returns the 64-channel voltage vector at the given sample index."""
         data = self.get_active_data()
         if data is None or sample_idx < 0 or sample_idx >= self.n_samples:
             return np.zeros(self.n_channels, dtype=np.float32)
         return data[:, sample_idx]
 
     def ingest_live_chunk(self, chunk_64: np.ndarray):
-        """
-        Closed-Loop Ingestion:
-        Ingests actively inputted data chunk (64, K) into the live stream buffer,
-        enabling live streaming EEG input in a closed-loop system.
-        """
         c = chunk_64.astype(np.float32)
         if self.raw_data is None:
             self.raw_data = c
@@ -409,13 +447,9 @@ class EEGDataLoader(QObject):
                     self.filtered_data = self.base_filtered_data
         self.n_channels, self.n_samples = self.raw_data.shape
         self.duration = self.n_samples / self.sfreq
+        self.live_chunk_ingested.emit()
 
     def process_live_frame(self, raw_sample_64: np.ndarray) -> np.ndarray:
-        """
-        Closed-Loop Real-Time Frame Processor:
-        Processes a single incoming 64-channel EEG frame through the closed-loop pipeline:
-        Applies real-time spatial projection if ICA cleaning is active.
-        """
         x = raw_sample_64.astype(np.float32)
         if self.ica_enabled and self.spatial_projection_matrix is not None and self.ica_mean is not None:
             mu = self.ica_mean.ravel()
@@ -423,15 +457,6 @@ class EEGDataLoader(QObject):
         return x
 
     def decompose_fastica(self, n_components: int = 16):
-        """
-        Dynamic FastICA Spatial Filter Engine:
-        Decomposes the 64-channel EEG array into independent components.
-        Ranks and tags components:
-        - IC0: Frontal vertical EOG / blinks (highest absolute frontal loading & kurtosis)
-        - IC1: Lateral anterior saccades (highest horizontal differential |F7 - F8|)
-        - IC2: Cardiac ECG pulse (rhythmic ~72 BPM QRS complexes)
-        - IC3: Temporal high-frequency EMG muscle activity
-        """
         print(f"[INFO] Running FastICA Spatial Decomposition ({n_components} components)...")
         t0 = time.perf_counter()
 
@@ -440,13 +465,11 @@ class EEGDataLoader(QObject):
         mean_X = np.mean(data, axis=1, keepdims=True)
         Xc = data - mean_X
 
-        # Subsample for sub-second decomposition speed
         max_pts = min(n_samples, int(self.sfreq * 60))
         step = max(1, n_samples // max_pts)
         Xc_sub = Xc[:, ::step]
         n_sub = Xc_sub.shape[1]
 
-        # 1. PCA Whitening
         cov = np.dot(Xc_sub, Xc_sub.T) / (n_sub - 1)
         d, E = np.linalg.eigh(cov)
         idx = np.argsort(d)[::-1][:n_components]
@@ -456,7 +479,6 @@ class EEGDataLoader(QObject):
         K = np.dot(np.diag(1.0 / np.sqrt(d)), E.T)
         Z = np.dot(K, Xc_sub)
 
-        # 2. FastICA Fixed-Point Iteration (Hyvärinen 1999)
         W = np.zeros((n_components, n_components), dtype=np.float32)
         np.random.seed(42)
         for j in range(n_components):
@@ -480,17 +502,13 @@ class EEGDataLoader(QObject):
         A_mix = np.linalg.pinv(W_unmix)
         S = np.dot(W_unmix, Xc)
 
-        # 3. Component Statistics & Automated Classification
-        # IC0: Frontal blink / vertical EOG (max absolute weight on Fp1, Fpz, Fp2)
         frontal_scores = np.sum(np.abs(A_mix[:3, :]), axis=0)
         ic0_idx = int(np.argmax(frontal_scores))
 
-        # IC1: Horizontal saccades (max difference between F7 and F8)
         lat_scores = np.abs(A_mix[8, :] - A_mix[16, :])
         lat_scores[ic0_idx] = -1.0
         ic1_idx = int(np.argmax(lat_scores))
 
-        # IC2: Cardiac ECG pulse (periodic heartbeat peaks)
         temp_indices = [26, 34, 35, 36]
         ecg_scores = np.zeros(n_components, dtype=np.float32)
         for c in range(n_components):
@@ -498,13 +516,11 @@ class EEGDataLoader(QObject):
                 s_c = S[c, :]
                 peaks, _ = scipy.signal.find_peaks(np.abs(s_c), distance=int(self.sfreq * 0.6), height=np.std(s_c)*2.0)
                 if len(peaks) > 10:
-                    # Regularity of inter-beat intervals
                     diffs = np.diff(peaks)
                     if np.std(diffs) < (0.25 * np.mean(diffs)):
                         ecg_scores[c] = float(len(peaks))
         ic2_idx = int(np.argmax(ecg_scores)) if np.max(ecg_scores) > 0 else (2 if 2 not in (ic0_idx, ic1_idx) else 3)
 
-        # IC3: Temporal EMG muscle activity
         temp_scores = np.sum(np.abs(A_mix[temp_indices, :]), axis=0)
         temp_scores[ic0_idx] = -1.0
         temp_scores[ic1_idx] = -1.0
@@ -517,11 +533,9 @@ class EEGDataLoader(QObject):
         self.ica_sources = S[order, :].astype(np.float32)
         self.ica_mean = mean_X.astype(np.float32)
 
-        # Compute Kurtosis and Variance Explained for each component
         total_data_var = np.sum(np.var(data, axis=1)) + 1e-6
         self.ic_components.clear()
 
-        # Snippet length: 600 points (~3.75s)
         snip_len = min(600, n_samples)
         for i in range(n_components):
             s_i = self.ica_sources[i, :]
@@ -532,7 +546,6 @@ class EEGDataLoader(QObject):
             back_proj_var = np.sum(np.var(np.outer(self.ica_mixing[:, i], s_i), axis=1))
             var_pct = float(back_proj_var / total_data_var * 100.0)
             
-            # Tags & Colors
             if i == 0:
                 tag, color = "OCULAR BLINK", "#FF5252"
             elif i == 1:
@@ -545,7 +558,6 @@ class EEGDataLoader(QObject):
                 tag, color = "NEURAL CORTICAL", "#69F0AE"
 
             snip = s_i[:snip_len].copy()
-            # Normalize snippet for thumbnail display
             snip_norm = (snip - np.mean(snip)) / (np.std(snip) + 1e-6)
             
             self.ic_components.append(IndependentComponentInfo(
@@ -563,7 +575,6 @@ class EEGDataLoader(QObject):
         dt = (time.perf_counter() - t0) * 1000.0
         print(f"[SUCCESS] FastICA Spatial Decomposition completed in {dt:.1f}ms. Extracted {n_components} components.")
 
-        # Re-apply current rejection preset if ICA is active
         if self.ica_enabled:
             self.apply_ica_rejection(self.ica_preset)
 
@@ -584,7 +595,6 @@ class EEGDataLoader(QObject):
         self._reconstruct_signal()
 
     def toggle_ic_component(self, ic_idx: int, reject: bool):
-        """Allows individual component selection from the Dedicated Pre-processing Workstation."""
         if reject:
             self.rejected_ic_indices.add(ic_idx)
         else:
@@ -597,11 +607,6 @@ class EEGDataLoader(QObject):
         self._reconstruct_signal()
 
     def apply_asr(self, cutoff_sd: float = 5.0, win_len_sec: float = 0.5):
-        """
-        Artifact Subspace Reconstruction (ASR):
-        Projects sliding windows against clean baseline calibration covariance and
-        reconstructs corrupted subspaces where variance exceeds cutoff_sd standard deviations.
-        """
         data = self.clean_data if self.clean_data is not None else self.base_filtered_data
         n_channels, n_samples = data.shape
         win_len = int(win_len_sec * self.sfreq)
@@ -640,11 +645,6 @@ class EEGDataLoader(QObject):
         return cleaned
 
     def _update_spatial_projection(self):
-        """
-        Updates the closed-loop 64x64 spatial filter projection matrix P.
-        For any incoming frame or active array:
-        x_clean = P @ (x - mu) + mu
-        """
         if self.ica_mixing is None or self.ica_unmixing is None:
             self.spatial_projection_matrix = None
             return
@@ -662,7 +662,6 @@ class EEGDataLoader(QObject):
             self.spatial_projection_matrix = np.dot(A_k, W_k).astype(np.float32)
 
     def _reconstruct_signal(self):
-        """Reconstructs the active EEG array from FastICA spatial projection and optional ASR."""
         if self.ica_sources is None or self.ica_mixing is None:
             if self.asr_enabled:
                 self.clean_data = self.apply_asr(self.asr_cutoff_sd)
@@ -685,13 +684,11 @@ class EEGDataLoader(QObject):
                     S_clean[idx, :] = 0.0
             reconstructed = (np.dot(self.ica_mixing, S_clean) + self.ica_mean).astype(np.float32)
 
-        # Apply ASR if enabled
         if self.asr_enabled:
             reconstructed = self.apply_asr(self.asr_cutoff_sd)
 
         self.clean_data = reconstructed
 
-        # Set active visualization buffer
         if self.ica_enabled or self.asr_enabled:
             self.filtered_data = self.clean_data
         else:
@@ -701,7 +698,6 @@ class EEGDataLoader(QObject):
         self.data_reconstructed.emit()
 
     def _compute_gfp_envelope(self):
-        """Computes Global Field Power (GFP) envelope for mini-map timeline navigation."""
         if self.filtered_data is None:
             return
         mean_v = np.mean(self.filtered_data, axis=0)
@@ -712,6 +708,166 @@ class EEGDataLoader(QObject):
         denom = (np.max(gfp_sub) - np.min(gfp_sub)) + 1e-6
         self.gfp_envelope = ((gfp_sub - np.min(gfp_sub)) / denom) * 0.7 - 0.35
 
+    # ==========================================================================
+    # PHASE 5 ANALYTICAL RETRIEVAL WRAPPERS
+    # ==========================================================================
+
+    def get_sliding_window_64(self, current_sample: int, window_sec: float = 2.0) -> np.ndarray:
+        data = self.get_active_data()
+        n_pts = int(window_sec * self.sfreq)
+        if data is None or current_sample <= 0:
+            return np.zeros((self.n_channels, n_pts), dtype=np.float32)
+        s0 = current_sample - n_pts
+        if s0 < 0:
+            pad_len = -s0
+            chunk = data[:, 0:max(0, current_sample)]
+            first_cols = chunk[:, [0]] if chunk.shape[1] > 0 else np.zeros((self.n_channels, 1), dtype=np.float32)
+            pad = np.repeat(first_cols, pad_len, axis=1)
+            return np.hstack([pad, chunk])
+        return data[:, s0:current_sample]
+
+    def get_psd_for_selection(
+        self,
+        current_sample: int,
+        window_sec: float = 2.0,
+        selected_channels: Optional[List[str]] = None
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Tuple[float, float]]]:
+        win_data = self.get_sliding_window_64(current_sample, window_sec)
+        if selected_channels and len(selected_channels) > 0:
+            indices = [self.channel_names.index(ch) for ch in selected_channels if ch in self.channel_names]
+            if len(indices) > 0:
+                win_data = win_data[indices, :]
+        freqs, psd = analytics.compute_welch_psd(win_data, self.sfreq)
+        bands = analytics.compute_band_powers(freqs, psd)
+        return freqs, psd, bands
+
+    def get_ersp_map(
+        self,
+        channel_name: str,
+        event_id: str = 'T1'
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        data = self.get_active_data()
+        if data is None or channel_name not in self.channel_names:
+            t = np.linspace(-1.0, 3.5, 72, dtype=np.float32)
+            f = np.linspace(6.0, 32.0, 26, dtype=np.float32)
+            return t, f, np.zeros((len(f), len(t)), dtype=np.float32)
+
+        ch_idx = self.channel_names.index(channel_name)
+        return analytics.compute_event_ersp(data, ch_idx, self.events, event_id, self.sfreq)
+
+    def get_connectivity_matrix(
+        self,
+        current_sample: int,
+        metric: str = "PLV",
+        band_name: str = "Alpha",
+        window_sec: float = 2.0
+    ) -> Tuple[np.ndarray, List[Tuple[str, str, float, Tuple[float, float], Tuple[float, float]]]]:
+        band = FREQUENCY_BANDS.get(band_name, (8.0, 12.0, ''))[:2]
+        win_data = self.get_sliding_window_64(current_sample, window_sec)
+
+        if metric == "PLV":
+            conn_mat = analytics.compute_plv_matrix(win_data, self.sfreq, band=band)
+        else:
+            conn_mat = analytics.compute_spectral_coherence_matrix(win_data, self.sfreq, band=band)
+
+        edges = analytics.get_top_connectivity_edges(conn_mat, self.channel_names, threshold=0.62, top_k=24)
+        return conn_mat, edges
+
+    def decode_motor_intent(self, current_sample: int, window_sec: float = 2.0) -> Tuple[Dict[str, float], str, float]:
+        win_data = self.get_sliding_window_64(current_sample, window_sec)
+        return self.bci_pipeline.decode_active_window(win_data)
+
+
+# ==============================================================================
+# LIVE STREAM INGESTION (LABSTREAMINGLAYER / PYLSL INLET THREAD)
+# ==============================================================================
+
+class LSLReceiverThread(QThread):
+    """
+    LabStreamingLayer (pylsl) Stream Receiver:
+    - Resolves real-time EEG streams over the local network (timeout=1.5s).
+    - Ingests streaming chunks into EEGDataLoader.ingest_live_chunk().
+    - High-fidelity synthetic fallback simulator for standalone testing without hardware.
+    """
+    chunk_received = pyqtSignal(np.ndarray)
+    status_changed = pyqtSignal(str, str)  # (text, color)
+    metrics_updated = pyqtSignal(float, float)  # (effective_fs, latency_ms)
+
+    def __init__(self, data_loader: EEGDataLoader, parent=None):
+        super().__init__(parent)
+        self.data_loader = data_loader
+        self.is_running = False
+        self.is_simulated = False
+        self.inlet = None
+        self.stream_name = "EEG"
+
+    def connect_stream(self, use_simulation: bool = False):
+        self.is_simulated = use_simulation
+        self.is_running = True
+        self.start()
+
+    def disconnect_stream(self):
+        self.is_running = False
+        self.wait(1000)
+        self.status_changed.emit("LSL: Disconnected", "#8C9BAE")
+
+    def run(self):
+        if not self.is_simulated and LSL_AVAILABLE:
+            self.status_changed.emit("LSL: Resolving Streams...", "#FFB300")
+            try:
+                streams = pylsl.resolve_byprop('type', 'EEG', timeout=2.0)
+                if len(streams) > 0:
+                    info = streams[0]
+                    self.inlet = pylsl.StreamInlet(info, max_buflen=360, max_chunklen=32)
+                    self.stream_name = info.name()
+                    self.status_changed.emit(f"LSL: Connected ({self.stream_name})", "#00FFA3")
+                else:
+                    self.status_changed.emit("LSL: No Stream Found (Running Simulator)", "#00E5FF")
+                    self.is_simulated = True
+            except Exception as e:
+                print(f"[WARN] LSL resolve exception: {e}. Falling back to simulation.")
+                self.is_simulated = True
+
+        if self.is_simulated or not LSL_AVAILABLE:
+            self.status_changed.emit("LSL Simulator: Active (160 Hz)", "#00FFA3")
+
+        t_last = time.perf_counter()
+        samples_count = 0
+
+        while self.is_running:
+            t0 = time.perf_counter()
+            if self.inlet is not None and not self.is_simulated:
+                try:
+                    samples, timestamps = self.inlet.pull_chunk(timeout=0.04, max_samples=32)
+                    if samples:
+                        arr = np.array(samples, dtype=np.float32).T
+                        if arr.shape[0] < 64:
+                            pad = np.zeros((64 - arr.shape[0], arr.shape[1]), dtype=np.float32)
+                            arr = np.vstack([arr, pad])
+                        chunk_64 = arr[:64, :]
+                        self.data_loader.ingest_live_chunk(chunk_64)
+                        self.chunk_received.emit(chunk_64)
+                        samples_count += chunk_64.shape[1]
+                except Exception as e:
+                    self.status_changed.emit(f"LSL Error: {e}", "#FF5252")
+                    break
+            else:
+                time.sleep(0.04)
+                k_samples = 6
+                chunk_sim = np.random.randn(64, k_samples).astype(np.float32) * 4.0
+                t_arr = np.linspace(0, 0.04, k_samples)
+                chunk_sim[60:64, :] += 18.0 * np.sin(2 * np.pi * 10.0 * t_arr)
+                self.data_loader.ingest_live_chunk(chunk_sim)
+                self.chunk_received.emit(chunk_sim)
+                samples_count += k_samples
+
+            now = time.perf_counter()
+            if now - t_last >= 1.0:
+                eff_fs = samples_count / (now - t_last)
+                latency = (time.perf_counter() - t0) * 1000.0
+                self.metrics_updated.emit(eff_fs, latency)
+                samples_count = 0
+                t_last = now
 
 
 # ==============================================================================
@@ -730,7 +886,7 @@ class PlaybackEngine(QObject):
         self.current_sample = 0
 
         self.timer = QTimer()
-        self.timer.setInterval(30)  # ~33 FPS wall-clock ticker
+        self.timer.setInterval(30)
         self.timer.timeout.connect(self._on_tick)
 
         self._last_tick_time = time.perf_counter()
@@ -786,9 +942,3 @@ class PlaybackEngine(QObject):
 
         t_sec = self.current_sample / self.data_loader.sfreq
         self.frame_changed.emit(self.current_sample, t_sec)
-
-
-# ==============================================================================
-# DEDICATED PRE-PROCESSING & ARTIFACT RECONSTRUCTION WORKSTATION (TOP-LEFT)
-# ==============================================================================
-
