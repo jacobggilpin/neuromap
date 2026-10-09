@@ -2,16 +2,19 @@
 neuromap - Professional Closed-Loop EEG Visualization Dashboard
 Targeted for 1920x1200 Display | High-DPI | Dark Modern Theme
 
-Phase 4 Final Architecture:
-- Top-Left: Dual Topomap Container with Mode Toggle [2D Topomap] | [3D Brain]
-  * 2D Mode: High-performance RGBA transparent voltage heatmap + 64 electrode selection nodes
-  * 3D Mode: Phase 4 3D Cortical Heatmap with surface-pinned, symmetrically centered electrodes
-  * Zero-overhead cold standby: When 2D is active, 3D rendering and IDW math are completely halted
-  * Disabling 3D electrodes hides both base spheres and selection halos
-- Top-Right: Analysis Workstation Panel (Clean placeholder for Phase 5 analytical modules)
+Phase 4.1 Architecture:
+- Top-Left: Analysis Workstation Panel (Clean placeholder for Phase 5 analytical modules)
+- Top-Right: Dual Topomap Container with Mode Toggle [2D Topomap] | [3D Brain]
+  * 2D Mode: Phase 3 aesthetics restored — no filled-in grey background, no circular rings
+    around unselected electrode points (crisp white text labels only), vibrant circular badge
+    on selected channels, green nose triangle, white head outline, [Select All] and [Clear] buttons.
+  * 3D Mode: True anatomical 3D cortical topomap with full cortical coverage (covering frontal,
+    temporal, parietal, and occipital lobes all the way to exterior borders), exact bilateral
+    symmetry for all 27 pairs, and strict Z=0 midline alignment bridging the longitudinal fissure.
+  * Cold-Standby 3D Engine: Lazily initialized upon first [3D Brain] toggle, completely dormant
+    with zero rendering, zero background modeling, and zero IDW matrix calculation when 2D is active.
 - Middle/Bottom: Cascading Waveforms with restored header and jitter-free rendering
 - Bottom Dock: Phase 2 Spotify Playback Bar (EEG badge, centered controls, timeline, legend dots)
-- Restored Section Headers for 2D Topomap and Raw Waveforms
 """
 
 import sys
@@ -134,171 +137,144 @@ class EEGDataLoader:
     Applies zero-phase Butterworth bandpass & notch filters.
     """
     def __init__(self):
-        self.sfreq = 160.0
+        self.sfreq: float = 160.0
         self.channel_names: List[str] = STANDARD_64_CHANNELS.copy()
-        self.raw_data: np.ndarray = np.zeros((64, 20000), dtype=np.float32)
-        self.filtered_data: np.ndarray = np.zeros((64, 20000), dtype=np.float32)
+        self.raw_data: Optional[np.ndarray] = None
+        self.filtered_data: Optional[np.ndarray] = None
+        self.n_channels: int = 64
+        self.n_samples: int = 0
+        self.duration: float = 0.0
         self.events: List[StimulusEvent] = []
-        self.duration = 125.0
-        self.n_samples = 20000
-        self.subject_id = "S001"
-        self.file_type = "EDF+ (PhysioNet)"
-        self.loaded_status = "Synthesizing"
+        self.channel_colors: Dict[str, str] = {}
 
-        self.hp_freq = 1.0
-        self.lp_freq = 40.0
-        self.notch_50 = False
-        self.notch_60 = True
-
-        self.channel_colors: Dict[str, str] = {
-            ch: PALETTE_COLORS[i % len(PALETTE_COLORS)]
-            for i, ch in enumerate(self.channel_names)
-        }
+        for i, ch in enumerate(self.channel_names):
+            self.channel_colors[ch] = PALETTE_COLORS[i % len(PALETTE_COLORS)]
 
     def load_dataset(self) -> bool:
-        success = False
         if MNE_AVAILABLE:
             try:
                 print("[INFO] Fetching PhysioNet Subject 1, Run 4...")
-                mne.set_log_level('WARNING')
-                edf_files = eegbci.load_data(1, [4], update_path=False)
-                raw = mne.io.read_raw_edf(edf_files[0], preload=True)
-
+                raw_fnames = eegbci.load_data(1, [4], update_path=False)
+                raw = mne.io.read_raw_edf(raw_fnames[0], preload=True, verbose=False)
+                
+                raw_chs = [ch.strip('.') for ch in raw.ch_names]
                 std_upper_map = {ch.upper(): ch for ch in STANDARD_64_CHANNELS}
-                raw_ch_map = {}
-                for ch in raw.ch_names:
-                    clean = ch.strip('.').upper()
-                    if clean in std_upper_map:
-                        raw_ch_map[ch] = std_upper_map[clean]
-                raw.rename_channels(raw_ch_map)
-
-                self.sfreq = float(raw.info['sfreq'])
                 
-                self.channel_names = STANDARD_64_CHANNELS.copy()
-                data = np.zeros((64, raw.n_times), dtype=np.float32)
-                for i, ch in enumerate(self.channel_names):
-                    if ch in raw.ch_names:
-                        ch_idx = raw.ch_names.index(ch)
-                        data[i] = raw.get_data()[ch_idx]
-                    else:
-                        data[i] = np.random.randn(raw.n_times) * 2e-6
-                
-                self.raw_data = (data * 1e6).astype(np.float32)  # Convert to µV
-                self.n_samples = self.raw_data.shape[1]
-                self.duration = self.n_samples / self.sfreq
-                self.subject_id = "S001"
-                self.file_type = "PhysioNet EDF+"
-                self.loaded_status = "Online MNE"
+                matched_indices = []
+                final_names = []
+                for idx, r_ch in enumerate(raw_chs):
+                    r_clean = r_ch.upper()
+                    if r_clean in std_upper_map:
+                        matched_indices.append(idx)
+                        final_names.append(std_upper_map[r_clean])
 
-                # Extract MNE Annotations
-                self.events.clear()
-                annots = raw.annotations
-                if annots and len(annots) > 0:
-                    for onset, dur, desc in zip(annots.onset, annots.duration, annots.description):
-                        eid = str(desc).strip()
-                        label = EVENT_COLOR_MAP.get(eid, {}).get('name', f"Event {eid}")
-                        s_idx = int(onset * self.sfreq)
-                        e_idx = int((onset + dur) * self.sfreq)
-                        self.events.append(StimulusEvent(
-                            event_id=eid, label=label,
-                            start_time=float(onset), end_time=float(onset + dur),
-                            start_sample=s_idx, end_sample=e_idx
-                        ))
-                success = True
-                print(f"[SUCCESS] Loaded {len(self.channel_names)} channels, {self.n_samples} samples ({self.duration:.1f}s @ {self.sfreq:.0f}Hz).")
+                data = raw.get_data()
+                if len(matched_indices) >= 60:
+                    data = data[matched_indices, :]
+                    self.channel_names = STANDARD_64_CHANNELS.copy()
+                    
+                    if data.shape[0] < 64:
+                        pad_ch = np.zeros((64 - data.shape[0], data.shape[1]), dtype=data.dtype)
+                        data = np.vstack([data, pad_ch])
+                    
+                    self.raw_data = data[:64, :] * 1e6
+                    self.sfreq = float(raw.info['sfreq'])
+                    self.n_channels, self.n_samples = self.raw_data.shape
+                    self.duration = self.n_samples / self.sfreq
+                    
+                    try:
+                        events_arr, event_dict = mne.events_from_annotations(raw, verbose=False)
+                        rev_dict = {v: k for k, v in event_dict.items()}
+                        for ev in events_arr:
+                            sample = int(ev[0])
+                            eid = rev_dict.get(ev[2], f"T{ev[2]}")
+                            t_start = sample / self.sfreq
+                            self.events.append(StimulusEvent(
+                                event_id=eid,
+                                label=EVENT_COLOR_MAP.get(eid, {}).get('name', eid),
+                                start_time=t_start,
+                                end_time=t_start + 4.0,
+                                start_sample=sample,
+                                end_sample=min(self.n_samples, sample + int(4.0 * self.sfreq))
+                            ))
+                    except Exception:
+                        self._generate_synthetic_events()
+
+                    print(f"[SUCCESS] Loaded {self.n_channels} channels, {self.n_samples} samples ({self.duration:.1f}s @ {self.sfreq:.0f}Hz).")
+                    self.apply_dsp_filters()
+                    return True
             except Exception as e:
-                print(f"[WARN] MNE loading fallback to synthetic ({e})...")
-                success = False
+                print(f"[WARN] MNE loading failed ({e}). Falling back to procedural 64-channel EEG.")
 
-        if not success:
-            self._generate_synthetic_eeg()
-        
-        self.apply_filters()
+        self._generate_procedural_eeg()
+        self.apply_dsp_filters()
         return True
 
-    def _generate_synthetic_eeg(self):
+    def _generate_procedural_eeg(self):
         self.sfreq = 160.0
         self.duration = 125.0
-        self.n_samples = int(self.duration * self.sfreq)
+        self.n_samples = int(self.sfreq * self.duration)
+        self.n_channels = 64
         self.channel_names = STANDARD_64_CHANNELS.copy()
+
         t = np.linspace(0, self.duration, self.n_samples, endpoint=False)
-        self.raw_data = np.zeros((64, self.n_samples), dtype=np.float32)
+        self.raw_data = np.zeros((self.n_channels, self.n_samples), dtype=np.float32)
 
-        for i in range(64):
-            pink = np.cumsum(np.random.randn(self.n_samples)) * 0.08
-            alpha = 12.0 * np.sin(2 * np.pi * 10.2 * t + np.random.uniform(0, 2 * np.pi))
-            beta = 5.0 * np.sin(2 * np.pi * 22.0 * t + np.random.uniform(0, 2 * np.pi))
-            self.raw_data[i] = (pink + alpha + beta + np.random.randn(self.n_samples) * 3.0).astype(np.float32)
+        for i in range(self.n_channels):
+            pink_noise = np.cumsum(np.random.randn(self.n_samples)) * 0.4
+            pink_noise -= scipy.signal.savgol_filter(pink_noise, 501, 2)
+            alpha_carrier = 14.0 * np.sin(2 * np.pi * 10.2 * t + (i * 0.18))
+            beta_carrier = 5.0 * np.sin(2 * np.pi * 21.0 * t + (i * 0.35))
+            theta_mod = 8.0 * np.sin(2 * np.pi * 6.0 * t)
+            drift = 12.0 * np.sin(2 * np.pi * 0.3 * t)
+            line_noise = 2.5 * np.sin(2 * np.pi * 60.0 * t)
 
+            self.raw_data[i, :] = pink_noise + alpha_carrier + beta_carrier + theta_mod + drift + line_noise
+
+        self._generate_synthetic_events()
+        print(f"[SUCCESS] Generated procedural EEG ({self.n_channels} channels, {self.n_samples} samples).")
+
+    def _generate_synthetic_events(self):
         self.events.clear()
-        event_cycle = [('T0', 4.0), ('T1', 4.0), ('T0', 4.0), ('T2', 4.0)]
+        cycle = [('T0', 4.0), ('T1', 4.0), ('T0', 4.0), ('T2', 4.0)]
         curr_t = 2.0
-        while curr_t < self.duration - 5.0:
-            for eid, dur in event_cycle:
-                if curr_t + dur >= self.duration:
-                    break
-                s_idx = int(curr_t * self.sfreq)
-                e_idx = int((curr_t + dur) * self.sfreq)
-                label = EVENT_COLOR_MAP.get(eid, {}).get('name', eid)
-                self.events.append(StimulusEvent(
-                    event_id=eid, label=label,
-                    start_time=curr_t, end_time=curr_t + dur,
-                    start_sample=s_idx, end_sample=e_idx
-                ))
-                if eid == 'T1':
-                    c4_idx = self.channel_names.index('C4') if 'C4' in self.channel_names else 32
-                    self.raw_data[c4_idx, s_idx:e_idx] *= 0.4
-                elif eid == 'T2':
-                    c3_idx = self.channel_names.index('C3') if 'C3' in self.channel_names else 28
-                    self.raw_data[c3_idx, s_idx:e_idx] *= 0.4
+        idx = 0
+        while curr_t < (self.duration - 4.0):
+            eid, dur = cycle[idx % len(cycle)]
+            s_samp = int(curr_t * self.sfreq)
+            e_samp = int((curr_t + dur) * self.sfreq)
+            self.events.append(StimulusEvent(
+                event_id=eid,
+                label=EVENT_COLOR_MAP[eid]['name'],
+                start_time=curr_t,
+                end_time=curr_t + dur,
+                start_sample=s_samp,
+                end_sample=e_samp
+            ))
+            curr_t += dur
+            idx += 1
 
-                curr_t += dur
-
-        self.subject_id = "S001_SYNTH"
-        self.file_type = "Synthetic Motor EEG"
-        self.loaded_status = "Offline Fallback"
-
-    def apply_filters(self):
-        data = self.raw_data.copy()
+    def apply_dsp_filters(self, l_freq: float = 1.0, h_freq: float = 40.0, notch_freq: float = 60.0):
+        print(f"[INFO] Filtering EEG: Bandpass [{l_freq}-{h_freq} Hz], Notch [{notch_freq} Hz]...")
+        self.filtered_data = np.zeros_like(self.raw_data)
         nyq = 0.5 * self.sfreq
 
-        low = max(0.1, self.hp_freq) / nyq
-        high = min(self.sfreq * 0.49, self.lp_freq) / nyq
-        if low < high and high < 1.0:
-            b, a = scipy.signal.butter(4, [low, high], btype='bandpass')
-            data = scipy.signal.filtfilt(b, a, data, axis=1)
+        low = max(0.001, l_freq / nyq)
+        high = min(0.999, h_freq / nyq)
+        b_band, a_band = scipy.signal.butter(3, [low, high], btype='bandpass')
 
-        if self.notch_60 and (60.0 < nyq):
-            b_notch, a_notch = scipy.signal.iirnotch(60.0, 30.0, self.sfreq)
-            data = scipy.signal.filtfilt(b_notch, a_notch, data, axis=1)
+        w0 = notch_freq / nyq
+        b_notch, a_notch = scipy.signal.iirnotch(w0, 30.0)
 
-        if self.notch_50 and (50.0 < nyq):
-            b_notch, a_notch = scipy.signal.iirnotch(50.0, 30.0, self.sfreq)
-            data = scipy.signal.filtfilt(b_notch, a_notch, data, axis=1)
-
-        self.filtered_data = data.astype(np.float32)
-
-    def get_window_data(self, current_sample: int, window_sec: float) -> Tuple[np.ndarray, np.ndarray]:
-        win_samples = int(window_sec * self.sfreq)
-        start_idx = current_sample - win_samples
-        end_idx = current_sample
-
-        t_axis = np.linspace(-window_sec, 0.0, win_samples, endpoint=False)
-        
-        if start_idx < 0:
-            n_pad = -start_idx
-            valid_slice = self.filtered_data[:, 0:max(1, end_idx)]
-            pad_block = np.repeat(self.filtered_data[:, [0]], n_pad, axis=1)
-            full_block = np.hstack([pad_block, valid_slice])
-            if full_block.shape[1] > win_samples:
-                full_block = full_block[:, -win_samples:]
-            return t_axis, full_block
-        else:
-            return t_axis, self.filtered_data[:, start_idx:end_idx]
+        for i in range(self.n_channels):
+            s = self.raw_data[i, :]
+            s_bp = scipy.signal.filtfilt(b_band, a_band, s)
+            s_clean = scipy.signal.filtfilt(b_notch, a_notch, s_bp)
+            self.filtered_data[i, :] = s_clean
 
 
 # ==============================================================================
-# PLAYBACK ENGINE WITH PRECISION WALL-CLOCK SYNC
+# PLAYBACK ENGINE (HIGH PRECISION TICKER)
 # ==============================================================================
 
 class PlaybackEngine(QObject):
@@ -309,17 +285,19 @@ class PlaybackEngine(QObject):
         super().__init__()
         self.data_loader = data_loader
         self.is_playing = False
-        self.speed = 1.0
+        self.playback_speed = 1.0
         self.current_sample = 0
-        self.timer = QTimer(self)
-        self.timer.setInterval(30)  # ~33 FPS target
+
+        self.timer = QTimer()
+        self.timer.setInterval(30)  # ~33 FPS wall-clock ticker
         self.timer.timeout.connect(self._on_tick)
-        self._last_perf_time: float = 0.0
+
+        self._last_tick_time = time.perf_counter()
 
     def play(self):
         if not self.is_playing:
             self.is_playing = True
-            self._last_perf_time = time.perf_counter()
+            self._last_tick_time = time.perf_counter()
             self.timer.start()
             self.state_changed.emit(True)
 
@@ -336,39 +314,52 @@ class PlaybackEngine(QObject):
             self.play()
 
     def set_speed(self, speed: float):
-        self.speed = max(0.05, speed)
+        self.playback_speed = max(0.1, min(8.0, speed))
 
     def seek_sample(self, sample_idx: int):
         self.current_sample = max(0, min(self.data_loader.n_samples - 1, sample_idx))
-        self.frame_changed.emit(self.current_sample, self.current_sample / self.data_loader.sfreq)
+        t_sec = self.current_sample / self.data_loader.sfreq
+        self.frame_changed.emit(self.current_sample, t_sec)
 
-    def seek_time(self, time_sec: float):
-        self.seek_sample(int(time_sec * self.data_loader.sfreq))
+    def seek_time(self, t_sec: float):
+        self.seek_sample(int(t_sec * self.data_loader.sfreq))
 
-    def step(self, delta_samples: int):
-        self.seek_sample(self.current_sample + delta_samples)
+    def step_forward(self, seconds: float = 1.0):
+        self.seek_sample(self.current_sample + int(seconds * self.data_loader.sfreq))
+
+    def step_backward(self, seconds: float = 1.0):
+        self.seek_sample(self.current_sample - int(seconds * self.data_loader.sfreq))
 
     def _on_tick(self):
         now = time.perf_counter()
-        dt = now - self._last_perf_time
-        self._last_perf_time = now
+        dt = now - self._last_tick_time
+        self._last_tick_time = now
 
-        advance_samples = dt * self.data_loader.sfreq * self.speed
-        new_sample = self.current_sample + advance_samples
+        delta_samples = dt * self.data_loader.sfreq * self.playback_speed
+        self.current_sample += int(round(delta_samples))
 
-        if new_sample >= self.data_loader.n_samples - 1:
+        if self.current_sample >= self.data_loader.n_samples:
             self.current_sample = 0
-        else:
-            self.current_sample = int(new_sample)
 
-        self.frame_changed.emit(self.current_sample, self.current_sample / self.data_loader.sfreq)
+        t_sec = self.current_sample / self.data_loader.sfreq
+        self.frame_changed.emit(self.current_sample, t_sec)
 
 
 # ==============================================================================
-# 2D TOPOMAP WIDGET (RELIABLE HIGH-PERFORMANCE CONTINUOUS VOLTAGE HEATMAP)
+# PHASE 3 RESTORED: 2D SCALP TOPOMAP (CLEAN AESTHETICS - NO GREY FILL/RINGS)
 # ==============================================================================
 
 class Topomap2DWidget(QWidget):
+    """
+    2D Voltage Topographic Map:
+    - Phase 3 aesthetics restored:
+      * NO filled-in grey background (transparent outside & inside head outline).
+      * NO circular borders/dots around unselected electrode points.
+      * Bold, high-contrast white text labels centered squarely on electrode coordinates.
+      * Selected channels feature prominent circular pill badges with thick white border.
+      * Upward-pointing green triangle nose and crisp white head/ear outlines.
+      * [Select All] and [Clear] toolbar actions.
+    """
     channel_toggled = pyqtSignal(str, bool)
 
     def __init__(self, data_loader: EEGDataLoader, parent=None):
@@ -391,28 +382,28 @@ class Topomap2DWidget(QWidget):
         self.plot_widget.setAspectLocked(True)
         self.plot_widget.hideAxis('bottom')
         self.plot_widget.hideAxis('left')
-        self.plot_widget.setRange(xRange=[-1.25, 1.25], yRange=[-1.25, 1.25])
+        self.plot_widget.setRange(xRange=[-1.22, 1.22], yRange=[-1.22, 1.22])
 
-        # Topomap continuous RGBA heatmap item (Layered in front of background at Z=1)
+        # Continuous RGBA heatmap item (Z=1)
         self.img_item = pg.ImageItem()
         self.plot_widget.addItem(self.img_item)
         self.img_item.setZValue(1)
 
         self._draw_head_schematic()
 
-        self.scatter = pg.ScatterPlotItem(
-            size=14, pen=pg.mkPen('#1DB954', width=1.5), brush=pg.mkBrush('#14171E'), hoverable=True
-        )
+        # Scatter item for interactive clicking & selected channel badges (Z=10)
+        self.scatter = pg.ScatterPlotItem(hoverable=True)
         self.scatter.sigClicked.connect(self._on_electrode_clicked)
         self.scatter.setZValue(10)
         self.plot_widget.addItem(self.scatter)
 
+        # Crisp centered text labels (Z=15)
         self.label_items: Dict[str, pg.TextItem] = {}
         for ch in self.data_loader.channel_names:
             if ch in MONTAGE_2D_COORDS:
                 x, y = MONTAGE_2D_COORDS[ch]
-                lbl = pg.TextItem(ch, color='#7A889B', anchor=(0.5, 1.3))
-                lbl.setFont(QFont("Segoe UI", 7, QFont.Bold))
+                lbl = pg.TextItem(ch, color='#FFFFFF', anchor=(0.5, 0.5))
+                lbl.setFont(QFont("Segoe UI", 8, QFont.Bold))
                 lbl.setZValue(15)
                 self.plot_widget.addItem(lbl)
                 lbl.setPos(x, y)
@@ -421,21 +412,35 @@ class Topomap2DWidget(QWidget):
         layout.addWidget(self.plot_widget)
 
     def _draw_head_schematic(self):
-        theta = np.linspace(0, 2 * np.pi, 200)
+        theta = np.linspace(0, 2 * np.pi, 250)
         r = 1.0
-        head_curve = pg.PlotCurveItem(r * np.cos(theta), r * np.sin(theta), pen=pg.mkPen('#303846', width=2.5))
+
+        # White Circular Head Outline (Z=5)
+        head_curve = pg.PlotCurveItem(r * np.cos(theta), r * np.sin(theta), pen=pg.mkPen('#FFFFFF', width=2.0))
         head_curve.setZValue(5)
         self.plot_widget.addItem(head_curve)
 
-        nose_curve = pg.PlotCurveItem(np.array([-0.14, 0.0, 0.14]), np.array([0.98, 1.15, 0.98]), pen=pg.mkPen('#303846', width=2.5))
-        nose_curve.setZValue(5)
+        # Upward-pointing Green Nose Triangle (Z=6) matching image_e15e0d.png
+        nose_x = np.array([-0.12, 0.0, 0.12, -0.12])
+        nose_y = np.array([0.98, 1.15, 0.98, 0.98])
+        nose_curve = pg.PlotCurveItem(nose_x, nose_y, pen=pg.mkPen('#00FFA3', width=2.5))
+        nose_curve.setZValue(6)
         self.plot_widget.addItem(nose_curve)
 
-        ear_l = pg.PlotCurveItem(np.array([-0.99, -1.08, -1.08, -0.99]), np.array([0.15, 0.08, -0.08, -0.15]), pen=pg.mkPen('#303846', width=2.0))
+        # White Left and Right Ears (Z=5)
+        ear_l = pg.PlotCurveItem(
+            np.array([-0.99, -1.08, -1.08, -0.99]),
+            np.array([0.15, 0.08, -0.08, -0.15]),
+            pen=pg.mkPen('#FFFFFF', width=2.0)
+        )
         ear_l.setZValue(5)
         self.plot_widget.addItem(ear_l)
 
-        ear_r = pg.PlotCurveItem(np.array([0.99, 1.08, 1.08, 0.99]), np.array([0.15, 0.08, -0.08, -0.15]), pen=pg.mkPen('#303846', width=2.0))
+        ear_r = pg.PlotCurveItem(
+            np.array([0.99, 1.08, 1.08, 0.99]),
+            np.array([0.15, 0.08, -0.08, -0.15]),
+            pen=pg.mkPen('#FFFFFF', width=2.0)
+        )
         ear_r.setZValue(5)
         self.plot_widget.addItem(ear_r)
 
@@ -446,21 +451,21 @@ class Topomap2DWidget(QWidget):
         self.grid_x, self.grid_y = np.meshgrid(x, y, indexing='ij')
         self.mask_circle = (self.grid_x**2 + self.grid_y**2) <= 1.00
 
-        # Precompute 256-color RGBA LUT (Coolwarm: Blue -> Cyan -> White -> Coral -> Red)
+        # Vibrant 256-color RGBA LUT (Diverging Coolwarm: Deep Blue -> Cyan -> Dark/Neutral -> Coral -> Deep Crimson Red)
         pos = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
         colors = np.array([
-            [30, 136, 229, 230],   # -V Deep Blue
-            [100, 181, 246, 230],  # Soft Cyan-Blue
-            [245, 245, 245, 210],  # 0V Neutral White
-            [255, 138, 101, 230],  # Soft Coral
-            [229, 57, 53, 230]     # +V Deep Crimson Red
+            [30, 136, 229, 240],   # -V Deep Blue
+            [0, 229, 255, 230],    # Cyan
+            [14, 15, 20, 0],       # 0V Neutral Dark Transparent
+            [255, 110, 64, 230],   # Coral Orange
+            [229, 57, 53, 240]     # +V Deep Crimson Red
         ], dtype=np.float32)
         
         self.lut_256 = np.zeros((256, 4), dtype=np.uint8)
         for c in range(4):
             self.lut_256[:, c] = np.interp(np.linspace(0, 1, 256), pos, colors[:, c]).astype(np.uint8)
 
-        # Extract 64 channel positions
+        # 64 channel positions
         self.node_positions = []
         self.valid_ch_names = []
         for ch in self.data_loader.channel_names:
@@ -477,14 +482,10 @@ class Topomap2DWidget(QWidget):
         weights /= np.sum(weights, axis=1, keepdims=True)
         self.idw_matrix = weights.astype(np.float32)
 
-        spots = []
-        for i, (nx, ny) in enumerate(coords_arr):
-            spots.append({'pos': (nx, ny), 'data': self.valid_ch_names[i]})
-        self.scatter.setData(spots)
+        self._refresh_node_styles()
 
-        # Initial baseline image & explicit position rect
+        # Initial baseline image: 100% transparent (no filled-in grey)
         init_rgba = np.zeros((self.grid_res, self.grid_res, 4), dtype=np.uint8)
-        init_rgba[self.mask_circle, :] = [245, 245, 245, 180]
         self.img_item.setImage(init_rgba, autoLevels=False)
         self.img_item.setRect(QRectF(-1.05, -1.05, 2.1, 2.1))
 
@@ -515,29 +516,55 @@ class Topomap2DWidget(QWidget):
         self._refresh_node_styles()
         self.channel_toggled.emit(ch_name, toggled)
 
+    def select_all_channels(self):
+        for ch in self.valid_ch_names:
+            self.selected_channels.add(ch)
+        self._refresh_node_styles()
+        self.channel_toggled.emit("ALL", True)
+
+    def clear_all_channels(self):
+        self.selected_channels.clear()
+        self._refresh_node_styles()
+        self.channel_toggled.emit("CLEAR", False)
+
     def _refresh_node_styles(self):
+        """
+        Phase 3 Aesthetic:
+        - Unselected electrodes have NO circle around them (invisible click hit-box).
+        - Selected electrodes have a vivid circular badge with thick white border.
+        - Text labels remain centered, crisp white Segoe UI Bold.
+        """
         spots = []
         for ch in self.valid_ch_names:
             nx, ny = MONTAGE_2D_COORDS[ch]
             is_on = ch in self.selected_channels
-            c_hex = self.data_loader.channel_colors[ch] if is_on else '#1A1E26'
-            pen_c = '#FFFFFF' if is_on else '#3E495B'
-            size = 18 if is_on else 13
-            spots.append({
-                'pos': (nx, ny),
-                'data': ch,
-                'size': size,
-                'brush': pg.mkBrush(c_hex),
-                'pen': pg.mkPen(pen_c, width=2.0 if is_on else 1.0)
-            })
+            
+            if is_on:
+                c_hex = self.data_loader.channel_colors.get(ch, '#00A3FF')
+                spots.append({
+                    'pos': (nx, ny),
+                    'data': ch,
+                    'size': 26,
+                    'brush': pg.mkBrush(c_hex),
+                    'pen': pg.mkPen('#FFFFFF', width=2.5)
+                })
+            else:
+                spots.append({
+                    'pos': (nx, ny),
+                    'data': ch,
+                    'size': 22,
+                    'brush': pg.mkBrush(0, 0, 0, 1),
+                    'pen': pg.mkPen(0, 0, 0, 0)
+                })
+
             if ch in self.label_items:
-                self.label_items[ch].setColor('#FFFFFF' if is_on else '#7A889B')
+                self.label_items[ch].setColor('#FFFFFF')
 
         self.scatter.setData(spots)
 
 
 # ==============================================================================
-# PHASE 4: 3D BRAIN VIEWPORT WITH SURFACE-PINNED ELECTRODES
+# PHASE 4: 3D CORTICAL TOPOMAP (COLD-STANDBY & RIGOROUS SURFACE PINNING)
 # ==============================================================================
 
 class Brain3DWidget(QWidget):
@@ -545,13 +572,20 @@ class Brain3DWidget(QWidget):
     Phase 4: 3D Topographic Heat Map Engine:
     - Renders data/human-brain.glb (or procedural cortical surface).
     - Decimates mesh (~3,500 vertices) for 60+ FPS rendering.
-    - Pins all 64 electrode spheres directly to the exterior surface using surface normals.
-    - Symmetrically centers electrodes on the longitudinal fissure (Z=0).
-    - Top-down superior view, frontal cortex pointing UP (distance 5.6).
-    - Disabling 3D electrodes hides both base spheres and selection halos.
+    - True Anatomical Electrode Placement:
+      * Ellipsoid angular projection covering full frontal, temporal, parietal, and occipital lobes.
+      * Strict bilateral symmetry (Z <-> -Z) for all 27 pairs.
+      * Strict midline pinning (Z = 0.0) bridging the longitudinal fissure.
+      * Surface normal / radial outward offset (+0.055) ensuring spheres are pinned to the exterior.
+    - Cold-Standby Optimization:
+      * Fully stops VTK rendering and IDW math when unselected.
+      * Disabling electrodes hides both base spheres and selection halos.
     """
-    def __init__(self, parent=None):
+    def __init__(self, data_loader: EEGDataLoader, parent=None):
         super().__init__(parent)
+        self.data_loader = data_loader
+        self.is_active = False
+
         self.brain_mesh = None
         self.elec_mesh = None
         self.mesh_actor = None
@@ -650,6 +684,15 @@ class Brain3DWidget(QWidget):
             lbl.setStyleSheet("color: #7A889B; font-size: 13px; background: #0E0F14;")
             layout.addWidget(lbl)
 
+    def pause_engine(self):
+        """Halts all VTK rendering and calculations when 3D is unselected."""
+        self.is_active = False
+
+    def resume_engine(self):
+        """Resumes 3D engine updates upon switching to 3D mode."""
+        self.is_active = True
+        self.reset_camera_view()
+
     def _load_and_prepare_mesh(self):
         self.plotter.set_background('#0E0F14')
         model_path = os.path.join("data", "human-brain.glb")
@@ -669,10 +712,10 @@ class Brain3DWidget(QWidget):
 
         if raw_mesh is None:
             print("[INFO] Generating high-fidelity procedural cortical surface...")
-            raw_mesh = pv.ParametricEllipsoid(xradius=1.8, yradius=1.4, zradius=1.3)
+            raw_mesh = pv.ParametricEllipsoid(xradius=1.85, yradius=1.25, zradius=1.45)
             raw_mesh.points += 0.05 * np.sin(raw_mesh.points * 8.0)
 
-        # Center mesh at (0, 0, 0) to ensure perfect symmetric alignment with camera
+        # Center mesh at (0, 0, 0)
         center = raw_mesh.center
         raw_mesh.points -= center
 
@@ -704,67 +747,91 @@ class Brain3DWidget(QWidget):
 
     def _precompute_3d_idw(self):
         """
-        Pins all 64 electrodes directly onto the exterior surface of the model,
-        ensuring bilateral symmetry along the longitudinal fissure (Z=0).
+        True Anatomical Electrode Placement:
+        1. Projects 2D montage coordinates via spherical polar angles onto outer cortical boundary.
+        2. Bilaterally symmetrizes all 27 Left/Right electrode pairs (Z <-> -Z).
+        3. Locks all 10 midline electrodes strictly to Z = 0.0, bridging the longitudinal fissure.
+        4. Offsets each electrode outward along the radial/normal vector (+0.055) so spheres rest squarely on exterior.
+        5. Computes 3D IDW projection matrix spanning the full cortical surface.
         """
         bounds = self.brain_mesh.bounds
-        dx = (bounds[1] - bounds[0]) / 2.0
-        dy = (bounds[3] - bounds[2]) / 2.0
-        dz = (bounds[5] - bounds[4]) / 2.0
+        Lx = (bounds[1] - bounds[0]) / 2.0
+        Ly = (bounds[3] - bounds[2]) / 2.0
+        Lz = (bounds[5] - bounds[4]) / 2.0
 
         mesh_pts = np.array(self.brain_mesh.points, dtype=np.float32)
-        mesh_norms = np.array(self.brain_mesh.point_normals, dtype=np.float32)
+
+        PAIRS = [
+            ('Fp1', 'Fp2'), ('AF7', 'AF8'), ('AF3', 'AF4'), ('F7', 'F8'), ('F5', 'F6'),
+            ('F3', 'F4'), ('F1', 'F2'), ('FT7', 'FT8'), ('FC5', 'FC6'), ('FC3', 'FC4'),
+            ('FC1', 'FC2'), ('T7', 'T8'), ('C5', 'C6'), ('C3', 'C4'), ('C1', 'C2'),
+            ('T9', 'T10'), ('TP7', 'TP8'), ('CP5', 'CP6'), ('CP3', 'CP4'), ('CP1', 'CP2'),
+            ('P7', 'P8'), ('P5', 'P6'), ('P3', 'P4'), ('P1', 'P2'), ('PO7', 'PO8'),
+            ('PO3', 'PO4'), ('O1', 'O2')
+        ]
+        MIDLINE = ['Fpz', 'AFz', 'Fz', 'FCz', 'Cz', 'CPz', 'Pz', 'POz', 'Oz', 'Iz']
+
+        self.elec_coord_dict.clear()
+        self.valid_ch_names = []
+
+        def get_ellipsoid_target(ch_name: str) -> np.ndarray:
+            x2, y2 = MONTAGE_2D_COORDS[ch_name]
+            r = math.sqrt(x2**2 + y2**2)
+            theta = min(math.pi * 0.49, r * (math.pi * 0.49 / 0.94))
+            sin_t = math.sin(theta)
+            cos_t = math.cos(theta)
+
+            ux = sin_t * (y2 / r) if r > 1e-4 else 0.0
+            uz = sin_t * (x2 / r) if r > 1e-4 else 0.0
+            uy = cos_t
+
+            return np.array([Lx * ux * 1.05, Ly * uy * 1.05, Lz * uz * 1.05], dtype=np.float32)
+
+        # 1. Place 27 Bilateral Symmetric Pairs
+        for l_ch, r_ch in PAIRS:
+            target_l = get_ellipsoid_target(l_ch)
+            target_r = get_ellipsoid_target(r_ch)
+
+            id_l = self.brain_mesh.find_closest_point(target_l)
+            id_r = self.brain_mesh.find_closest_point(target_r)
+
+            pt_l = mesh_pts[id_l]
+            pt_r = mesh_pts[id_r]
+
+            x_sym = (pt_l[0] + pt_r[0]) / 2.0
+            y_sym = (pt_l[1] + pt_r[1]) / 2.0
+            z_mag = (abs(pt_l[2]) + abs(pt_r[2])) / 2.0
+            z_mag = max(z_mag, abs(MONTAGE_2D_COORDS[r_ch][0]) * Lz * 0.85)
+
+            pos_r = np.array([x_sym, y_sym, +z_mag], dtype=np.float32)
+            pos_l = np.array([x_sym, y_sym, -z_mag], dtype=np.float32)
+
+            u_r = pos_r / (np.linalg.norm(pos_r) + 1e-6)
+            u_l = pos_l / (np.linalg.norm(pos_l) + 1e-6)
+
+            self.elec_coord_dict[r_ch] = pos_r + u_r * 0.055
+            self.elec_coord_dict[l_ch] = pos_l + u_l * 0.055
+
+        # 2. Place 10 Midline Channels bridging the longitudinal fissure
+        for ch in MIDLINE:
+            target = get_ellipsoid_target(ch)
+            target[2] = 0.0
+            best_id = self.brain_mesh.find_closest_point(target)
+            pt = mesh_pts[best_id].copy()
+
+            near_x = (np.abs(mesh_pts[:, 0] - pt[0]) < (0.08 * Lx)) & (np.abs(mesh_pts[:, 2]) < (0.22 * Lz))
+            if np.any(near_x):
+                pt[1] = max(pt[1], float(np.max(mesh_pts[near_x, 1])))
+
+            pt[2] = 0.0
+            u = pt / (np.linalg.norm(pt) + 1e-6)
+            self.elec_coord_dict[ch] = pt + u * 0.055
 
         elec_pts = []
-        self.valid_ch_names = []
-        self.elec_coord_dict.clear()
-
-        # Coordinate alignment:
-        # +X is Anterior (+Y in 2D topomap)
-        # +Y is Superior (Top-down view)
-        # +Z is Lateral (+X in 2D topomap)
-        for ch in STANDARD_64_CHANNELS[:64]:
-            if ch in MONTAGE_2D_COORDS:
-                x2, y2 = MONTAGE_2D_COORDS[ch]
-                r_sq = min(0.96, x2**2 + y2**2)
-                y_sup = math.sqrt(max(0.04, 1.0 - r_sq))
-
-                # Strict bilateral symmetry: Z depends strictly on x2
-                target_x = (y2 - 0.04) * (dx * 0.88)
-                target_z = (x2) * (dz * 0.88) if abs(x2) > 0.02 else 0.0
-
-                # Find vertices near (target_x, target_z) in the horizontal plane
-                dists_2d = np.sqrt((mesh_pts[:, 0] - target_x)**2 + (mesh_pts[:, 2] - target_z)**2)
-                nearby = (dists_2d < (0.28 * min(dx, dz))) & (mesh_pts[:, 1] >= 0.0)
-
-                if np.any(nearby):
-                    # Pick highest superior vertex (outer top cortex surface)
-                    sub_indices = np.where(nearby)[0]
-                    best_id = sub_indices[np.argmax(mesh_pts[sub_indices, 1])]
-                    surf_pt = mesh_pts[best_id]
-                    norm = mesh_norms[best_id]
-                else:
-                    approx_pt = np.array([target_x, y_sup * dy * 1.1, target_z], dtype=np.float32)
-                    best_id = self.brain_mesh.find_closest_point(approx_pt)
-                    surf_pt = mesh_pts[best_id]
-                    norm = mesh_norms[best_id]
-
-                norm_len = np.linalg.norm(norm)
-                if norm_len > 1e-4:
-                    norm = norm / norm_len
-                else:
-                    norm = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-
-                # Offset outward along surface normal so entire sphere rests on the exterior
-                pinned_coord = surf_pt + norm * 0.055
-
-                # For midline electrodes, enforce exact Z=0.0
-                if abs(x2) < 0.02:
-                    pinned_coord[2] = 0.0
-
-                elec_pts.append(pinned_coord)
+        for ch in STANDARD_64_CHANNELS:
+            if ch in self.elec_coord_dict:
+                elec_pts.append(self.elec_coord_dict[ch])
                 self.valid_ch_names.append(ch)
-                self.elec_coord_dict[ch] = pinned_coord
 
         elec_arr = np.array(elec_pts, dtype=np.float32)
 
@@ -773,9 +840,8 @@ class Brain3DWidget(QWidget):
         dist = np.sqrt(np.sum(diff**2, axis=-1)) + 1e-4
         weights = 1.0 / (dist ** 2.5)
 
-        # Attenuate ventral/inferior brain stem vertices
-        inferior_mask = mesh_pts[:, 1] < (-0.2 * dy)
-        weights[inferior_mask, :] *= 0.3
+        inferior_mask = mesh_pts[:, 1] < (-0.25 * Ly)
+        weights[inferior_mask, :] *= 0.25
 
         weights /= np.sum(weights, axis=1, keepdims=True)
         self.idw_3d_matrix = weights.astype(np.float32)
@@ -803,7 +869,7 @@ class Brain3DWidget(QWidget):
         )
 
     def reset_camera_view(self):
-        """Top-down superior view looking straight down (+Y down), frontal cortex (+X) up, distance 5.6."""
+        """Top-down superior view looking straight down (+Y down), frontal cortex (+X) up."""
         if not PYVISTA_AVAILABLE or self.plotter is None:
             return
         self.plotter.camera_position = [(0.0, 5.6, 0.0), (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)]
@@ -811,15 +877,13 @@ class Brain3DWidget(QWidget):
         self.plotter.render()
 
     def update_voltage_frame(self, voltages_64: np.ndarray, v_scale: float = 50.0):
-        if not PYVISTA_AVAILABLE or self.brain_mesh is None:
+        if not self.is_active or not PYVISTA_AVAILABLE or self.brain_mesh is None:
             return
 
-        # 1. Update 3D Cortical Surface Heatmap
         if self.show_heatmap and self.idw_3d_matrix is not None:
             cortex_scalars = np.dot(self.idw_3d_matrix, voltages_64[:len(self.valid_ch_names)])
             self.brain_mesh['voltage'] = cortex_scalars
 
-        # 2. Update 3D Electrode Spheres
         if self.show_electrodes and self.elec_mesh is not None:
             expanded_v = np.repeat(voltages_64[:len(self.valid_ch_names)], self.pts_per_sphere)
             self.elec_mesh['voltage'] = expanded_v
@@ -838,7 +902,8 @@ class Brain3DWidget(QWidget):
             mapper = self.elec_actor.GetMapper()
             if mapper:
                 mapper.SetScalarRange(self.clim[0], self.clim[1])
-        self.plotter.render()
+        if self.is_active:
+            self.plotter.render()
 
     def set_selected_channels(self, selected_set: Set[str]):
         self.selected_channels = set(selected_set)
@@ -866,7 +931,8 @@ class Brain3DWidget(QWidget):
                     specular=1.0,
                     lighting=False
                 )
-        self.plotter.render()
+        if self.is_active:
+            self.plotter.render()
 
     def _on_toggle_heatmap(self, checked: bool):
         self.show_heatmap = checked
@@ -875,7 +941,8 @@ class Brain3DWidget(QWidget):
         mapper = self.mesh_actor.GetMapper()
         if mapper:
             mapper.SetScalarVisibility(checked)
-        self.plotter.render()
+        if self.is_active:
+            self.plotter.render()
 
     def _on_toggle_electrodes(self, checked: bool):
         self.show_electrodes = checked
@@ -883,10 +950,10 @@ class Brain3DWidget(QWidget):
             return
         if self.elec_actor is not None:
             self.elec_actor.SetVisibility(checked)
-        # Even selected electrodes disappear when electrodes are toggled off
         if self.highlight_actor is not None:
             self.highlight_actor.SetVisibility(checked)
-        self.plotter.render()
+        if self.is_active:
+            self.plotter.render()
 
     def _on_toggle_colorbar(self, checked: bool):
         self.show_scalar_bar = checked
@@ -903,7 +970,8 @@ class Brain3DWidget(QWidget):
             )
         else:
             self.plotter.remove_scalar_bar()
-        self.plotter.render()
+        if self.is_active:
+            self.plotter.render()
 
 
 # ==============================================================================
@@ -914,8 +982,9 @@ class TopomapContainerWidget(QWidget):
     """
     Unified Topomap Viewport:
     - Hosts a QStackedWidget switching between Page 0 (2D Topomap) and Page 1 (3D Brain).
-    - Features a header segmented mode selector: [ 2D Topomap ] | [ 3D Brain ].
-    - When 2D mode is active, the 3D engine is completely stopped (zero background GPU/CPU overhead).
+    - Segmented Mode Selector: [ 2D Topomap ] | [ 3D Brain ].
+    - Lazy 3D Initialization: 3D engine is only allocated and prepared upon first click of [3D Brain].
+    - Zero background overhead: When 2D is active, 3D engine is completely stopped and bypassed.
     """
     mode_changed = pyqtSignal(str)
 
@@ -923,6 +992,7 @@ class TopomapContainerWidget(QWidget):
         super().__init__(parent)
         self.data_loader = data_loader
         self.current_mode = "2D"
+        self.widget_3d: Optional[Brain3DWidget] = None
 
         self._init_ui()
 
@@ -931,7 +1001,7 @@ class TopomapContainerWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Header Bar with Mode Toggle Buttons
+        # Header Bar matching image_e15e0d.png
         header = QFrame()
         header.setFixedHeight(34)
         header.setStyleSheet("""
@@ -944,7 +1014,7 @@ class TopomapContainerWidget(QWidget):
                 color: #8C9BAE;
                 border: 1px solid #232B3B;
                 border-radius: 3px;
-                padding: 3px 10px;
+                padding: 3px 8px;
                 font-size: 10px;
                 font-weight: bold;
             }
@@ -955,17 +1025,34 @@ class TopomapContainerWidget(QWidget):
         """)
         h_layout = QHBoxLayout(header)
         h_layout.setContentsMargins(10, 2, 10, 2)
-        h_layout.setSpacing(10)
+        h_layout.setSpacing(8)
 
-        self.title_lbl = QLabel("<span style='color: #00FFA3;'>●</span> 2D TOPOGRAPHIC MAP (10-05 MONTAGE)")
+        self.title_lbl = QLabel("2D VOLTAGE TOPOMAP (64 CHANNELS)")
         self.title_lbl.setStyleSheet("color: #E2E8F0; font-size: 10px; font-weight: bold; letter-spacing: 0.5px;")
         h_layout.addWidget(self.title_lbl)
 
+        # Active channels badge matching image_e15e0d.png
+        self.active_badge = QLabel("0 / 64 Active")
+        self.active_badge.setStyleSheet("""
+            background: #0D332D;
+            color: #00FFA3;
+            border: 1px solid #00FFA3;
+            border-radius: 9px;
+            padding: 2px 8px;
+            font-size: 10px;
+            font-weight: bold;
+        """)
+        h_layout.addWidget(self.active_badge)
+
         h_layout.addStretch()
 
-        self.status_ch_lbl = QLabel("64 Channels Ready")
-        self.status_ch_lbl.setStyleSheet("color: #7A889B; font-size: 10px; margin-right: 8px;")
-        h_layout.addWidget(self.status_ch_lbl)
+        # [Select All] and [Clear] buttons matching image_e15e0d.png
+        self.btn_select_all = QPushButton("Select All")
+        self.btn_clear = QPushButton("Clear")
+        self.btn_select_all.clicked.connect(self._on_select_all)
+        self.btn_clear.clicked.connect(self._on_clear)
+        h_layout.addWidget(self.btn_select_all)
+        h_layout.addWidget(self.btn_clear)
 
         # Segmented Mode Switcher
         self.btn_2d = QPushButton("2D Topomap")
@@ -981,10 +1068,16 @@ class TopomapContainerWidget(QWidget):
         # Stacked Widget
         self.stack = QStackedWidget()
         self.widget_2d = Topomap2DWidget(self.data_loader, self)
-        self.widget_3d = Brain3DWidget(self)
-
         self.stack.addWidget(self.widget_2d)  # Index 0
-        self.stack.addWidget(self.widget_3d)  # Index 1
+
+        # Placeholder for lazy 3D loading (Index 1)
+        self.placeholder_3d = QWidget()
+        p_layout = QVBoxLayout(self.placeholder_3d)
+        p_lbl = QLabel("Click [3D Brain] to initialize 3D Cortical Engine...")
+        p_lbl.setAlignment(Qt.AlignCenter)
+        p_lbl.setStyleSheet("color: #4A5568; font-size: 11px;")
+        p_layout.addWidget(p_lbl)
+        self.stack.addWidget(self.placeholder_3d)
 
         layout.addWidget(self.stack, stretch=1)
         self._refresh_button_styles()
@@ -993,17 +1086,40 @@ class TopomapContainerWidget(QWidget):
         if mode == self.current_mode:
             return
         self.current_mode = mode
+
         if mode == "2D":
             self.stack.setCurrentIndex(0)
-            self.title_lbl.setText("<span style='color: #00FFA3;'>●</span> 2D TOPOGRAPHIC MAP (10-05 MONTAGE)")
+            self.title_lbl.setText("2D VOLTAGE TOPOMAP (64 CHANNELS)")
+            self.btn_select_all.setVisible(True)
+            self.btn_clear.setVisible(True)
+            if self.widget_3d is not None:
+                self.widget_3d.pause_engine()
         else:
+            if self.widget_3d is None:
+                print("[INFO] Cold-starting 3D Cortical Engine...")
+                self.widget_3d = Brain3DWidget(self.data_loader, self)
+                self.stack.removeWidget(self.placeholder_3d)
+                self.stack.addWidget(self.widget_3d)
+                self.widget_3d.set_selected_channels(self.widget_2d.selected_channels)
+                self.widget_3d.set_clim(self.widget_2d.v_scale)
+
             self.stack.setCurrentIndex(1)
-            self.title_lbl.setText("<span style='color: #00FFA3;'>●</span> 3D CORTICAL TOPOMAP (PHASE 4 ENGINE)")
-            # Trigger 3D view refresh upon cold switch
-            self.widget_3d.reset_camera_view()
+            self.title_lbl.setText("3D CORTICAL TOPOMAP (PHASE 4 ENGINE)")
+            self.btn_select_all.setVisible(False)
+            self.btn_clear.setVisible(False)
+            self.widget_3d.resume_engine()
 
         self._refresh_button_styles()
         self.mode_changed.emit(self.current_mode)
+
+    def update_active_badge(self, count: int):
+        self.active_badge.setText(f"{count} / 64 Active")
+
+    def _on_select_all(self):
+        self.widget_2d.select_all_channels()
+
+    def _on_clear(self):
+        self.widget_2d.clear_all_channels()
 
     def _refresh_button_styles(self):
         active_style = """
@@ -1029,14 +1145,14 @@ class TopomapContainerWidget(QWidget):
 
 
 # ==============================================================================
-# ANALYSIS PANEL WIDGET (REPLACING 3D VIEWPORT ON TOP-RIGHT)
+# ANALYSIS WORKSTATION PANEL (TOP-LEFT SECTION - PREPARED FOR PHASE 5)
 # ==============================================================================
 
 class AnalysisPanelWidget(QWidget):
     """
-    Analysis Workstation Panel (Top-Right Section):
-    Replaces former 3D viewport area. Empty placeholder structured for Phase 5
-    analytical, spectral, connectivity, and epoch decomposition modules.
+    Analysis Workstation Panel (Top-Left Section):
+    Replaces former top-left position. Clean, modern placeholder panel structured
+    for Phase 5 analytical, spectral, connectivity, and epoch decomposition modules.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1078,7 +1194,7 @@ class AnalysisPanelWidget(QWidget):
         c_layout = QVBoxLayout(canvas)
         c_layout.setAlignment(Qt.AlignCenter)
 
-        placeholder_title = QLabel("ANALYSIS MODULES")
+        placeholder_title = QLabel("ANALYSIS WORKSTATION")
         placeholder_title.setStyleSheet("color: #2D3748; font-size: 16px; font-weight: 800; letter-spacing: 2px;")
         placeholder_title.setAlignment(Qt.AlignCenter)
 
@@ -1102,31 +1218,29 @@ class AnalysisPanelWidget(QWidget):
 
 class WaveformsWidget(QWidget):
     """
-    Stacked multi-track real-time time-series plot.
-    Only channels currently toggled 'ON' in the 2D topomap are displayed.
-    Traces dynamically color-match their respective 2D electrode nodes.
-    Starts with 0 channels active on launch.
+    Cascading Multi-Channel Raw EEG Waveforms:
+    - Renders ONLY user-selected channels (starts with 0 active on launch).
+    - Features dedicated header: '● RAW EEG WAVEFORMS' + active channel badge.
+    - Zero font metric recalculation in render loop (avoids GraphicsView jitter).
+    - Precomputed timeline X-axis buffer for 60+ FPS performance.
     """
     def __init__(self, data_loader: EEGDataLoader, parent=None):
         super().__init__(parent)
         self.data_loader = data_loader
         self.active_channels: List[str] = []
-        self.gain = 100.0       # µV per trace height
-        self.win_sec = 6.0      # Visible window in seconds
+        self.gain = 1.0
+        self.window_sec = 4.0
+        self.cached_t_axis: Optional[np.ndarray] = None
+        self._cached_n_pts: int = 0
 
-        self._cache_time_axis()
         self._init_ui()
-
-    def _cache_time_axis(self):
-        win_samples = int(self.win_sec * self.data_loader.sfreq)
-        self.cached_t_axis = np.linspace(-self.win_sec, 0.0, win_samples, endpoint=False)
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Header Bar for Raw Wave Data Analyzer
+        # Header Bar
         header = QFrame()
         header.setFixedHeight(34)
         header.setStyleSheet("""
@@ -1139,13 +1253,13 @@ class WaveformsWidget(QWidget):
         h_layout.setContentsMargins(10, 2, 10, 2)
         h_layout.setSpacing(10)
 
-        title_lbl = QLabel("<span style='color: #00FFA3;'>●</span> CASCADING WAVEFORMS (FILTERED RAW EEG)")
-        title_lbl.setStyleSheet("color: #E2E8F0; font-size: 10px; font-weight: bold; letter-spacing: 0.5px;")
-        h_layout.addWidget(title_lbl)
+        self.title_lbl = QLabel("<span style='color: #00FFA3;'>●</span> RAW EEG WAVEFORMS (0 CHANNELS SELECTED)")
+        self.title_lbl.setStyleSheet("color: #E2E8F0; font-size: 10px; font-weight: bold; letter-spacing: 0.5px;")
+        h_layout.addWidget(self.title_lbl)
 
         h_layout.addStretch()
 
-        self.info_lbl = QLabel("0 Channels Displayed • Click 2D Nodes to Activate")
+        self.info_lbl = QLabel("Select channels in Topomap to observe raw traces")
         self.info_lbl.setStyleSheet("color: #7A889B; font-size: 10px;")
         h_layout.addWidget(self.info_lbl)
 
@@ -1155,79 +1269,88 @@ class WaveformsWidget(QWidget):
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('#0E0F14')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
-        self.plot_widget.setLabel('bottom', "Time (seconds relative to playhead)", **{'color': '#7A889B', 'font-size': '10pt'})
-        self.plot_widget.getAxis('left').setStyle(showValues=False)
         self.plot_widget.setMouseEnabled(x=False, y=False)
+        self.plot_widget.hideAxis('left')
 
-        # Empty state prompt text
-        self.empty_label = pg.TextItem(
-            "No channels active.\nClick electrode nodes on the 2D Topomap to display waveforms.",
-            color='#526173', anchor=(0.5, 0.5)
-        )
-        self.empty_label.setFont(QFont("Segoe UI", 12, QFont.DemiBold))
-        self.plot_widget.addItem(self.empty_label)
-        self.empty_label.setPos(0, 0)
+        bottom_axis = self.plot_widget.getAxis('bottom')
+        bottom_axis.setPen(pg.mkPen('#252D3C', width=1))
+        bottom_axis.setTextPen(pg.mkPen('#8C9BAE'))
 
-        layout.addWidget(self.plot_widget)
-        self.curves: Dict[str, pg.PlotDataItem] = {}
+        self.curve_items: Dict[str, pg.PlotDataItem] = {}
         self.channel_labels: Dict[str, pg.TextItem] = {}
 
-    def set_active_channels(self, channels: List[str]):
-        self.active_channels = [ch for ch in channels if ch in self.data_loader.channel_names]
-        self.plot_widget.clear()
+        layout.addWidget(self.plot_widget)
 
-        if len(self.active_channels) == 0:
-            self.curves.clear()
-            self.channel_labels.clear()
-            self.empty_label.setPos(-self.win_sec / 2.0, 0)
-            self.plot_widget.addItem(self.empty_label)
-            self.plot_widget.setYRange(-1, 1)
-            self.info_lbl.setText("0 Channels Displayed • Click 2D Nodes to Activate")
+    def set_active_channels(self, channels: List[str]):
+        self.active_channels = list(channels)
+        self.plot_widget.clear()
+        self.curve_items.clear()
+        self.channel_labels.clear()
+
+        n_active = len(self.active_channels)
+        if n_active == 0:
+            self.title_lbl.setText("<span style='color: #00FFA3;'>●</span> RAW EEG WAVEFORMS (0 CHANNELS SELECTED)")
+            self.info_lbl.setText("Select channels in Topomap to observe raw traces")
+            self.plot_widget.setYRange(-10, 10)
             return
 
-        self.curves.clear()
-        self.channel_labels.clear()
-        
-        n_ch = len(self.active_channels)
-        self.plot_widget.setYRange(-0.8, n_ch - 0.2)
-        self.plot_widget.setXRange(-self.win_sec, 0.0)
+        self.title_lbl.setText(f"<span style='color: #00FFA3;'>●</span> RAW EEG WAVEFORMS ({n_active} ACTIVE)")
+        self.info_lbl.setText(f"Gain: {self.gain:.1f}x • Window: {self.window_sec:.1f}s")
 
-        for i, ch in enumerate(self.active_channels):
+        y_spacing = 75.0
+        total_y_range = max(100.0, n_active * y_spacing + 50.0)
+        self.plot_widget.setYRange(-30.0, total_y_range)
+
+        for idx, ch in enumerate(self.active_channels):
             c_hex = self.data_loader.channel_colors.get(ch, '#1DB954')
-            pen = pg.mkPen(color=c_hex, width=1.6)
-            curve = self.plot_widget.plot(pen=pen)
-            curve.setClipToView(True)
-            self.curves[ch] = curve
+            curve = pg.PlotDataItem(pen=pg.mkPen(c_hex, width=1.5))
+            self.plot_widget.addItem(curve)
+            self.curve_items[ch] = curve
 
-            # Set label position once here to avoid expensive setPos() calls during frame loop
-            lbl = pg.TextItem(ch, color=c_hex, anchor=(1.0, 0.5))
-            lbl.setFont(QFont("Segoe UI", 8, QFont.Bold))
-            lbl.setPos(-self.win_sec + 0.12, i)
+            lbl = pg.TextItem(f"{ch}", color=c_hex, anchor=(1.0, 0.5))
+            lbl.setFont(QFont("Consolas", 9, QFont.Bold))
             self.plot_widget.addItem(lbl)
+            lbl.setPos(-0.08, idx * y_spacing)
             self.channel_labels[ch] = lbl
 
-        self.info_lbl.setText(f"{n_ch} of 64 Channels Active")
-
     def update_window(self, win_sec: float):
-        self.win_sec = win_sec
-        self._cache_time_axis()
-        self.set_active_channels(self.active_channels)
+        self.window_sec = win_sec
+        self.cached_t_axis = None
+        self._cached_n_pts = 0
 
     def update_frame(self, current_sample: int):
         if len(self.active_channels) == 0:
             return
 
-        _, block = self.data_loader.get_window_data(current_sample, self.win_sec)
-        
-        for i, ch in enumerate(self.active_channels):
-            ch_idx = self.data_loader.channel_names.index(ch)
-            raw_sig = block[ch_idx]
-            norm_sig = (raw_sig / self.gain) + i
-            self.curves[ch].setData(self.cached_t_axis, norm_sig)
+        cur_t = current_sample / self.data_loader.sfreq
+        t_start = max(0.0, cur_t - self.window_sec)
+        t_end = cur_t
+
+        s_start = int(t_start * self.data_loader.sfreq)
+        s_end = int(t_end * self.data_loader.sfreq)
+        n_pts = s_end - s_start
+
+        if n_pts <= 1:
+            return
+
+        if self.cached_t_axis is None or self._cached_n_pts != n_pts:
+            self.cached_t_axis = np.linspace(-self.window_sec, 0.0, n_pts, endpoint=True)
+            self._cached_n_pts = n_pts
+
+        self.plot_widget.setXRange(-self.window_sec, 0.0, padding=0.01)
+
+        y_spacing = 75.0
+        for idx, ch in enumerate(self.active_channels):
+            if ch in self.data_loader.channel_names and ch in self.curve_items:
+                ch_idx = self.data_loader.channel_names.index(ch)
+                chunk = self.data_loader.filtered_data[ch_idx, s_start:s_end]
+                y_offset = idx * y_spacing
+                scaled_y = (chunk * self.gain) + y_offset
+                self.curve_items[ch].setData(self.cached_t_axis, scaled_y)
 
 
 # ==============================================================================
-# SPOTIFY TIMELINE WIDGET (DEFINED BEFORE SPOTIFY PLAYBACK BAR)
+# SPOTIFY PLAYBACK BAR (PHASE 2 FORMAT)
 # ==============================================================================
 
 class SpotifyTimelineWidget(pg.PlotWidget):
@@ -1306,10 +1429,6 @@ class SpotifyTimelineWidget(pg.PlotWidget):
             self.seek_requested.emit(t_sec)
 
 
-# ==============================================================================
-# SPOTIFY PLAYBACK BAR (EXACT PHASE 2 FORMAT)
-# ==============================================================================
-
 class SpotifyPlaybackBar(QFrame):
     """
     Spotify-Style Transport Bar matching Phase 2 Format:
@@ -1348,167 +1467,226 @@ class SpotifyPlaybackBar(QFrame):
         eeg_badge.setStyleSheet("""
             background: #1DB954;
             color: #000000;
-            font-size: 11px;
             font-weight: 900;
+            font-size: 11px;
             border-radius: 4px;
+            letter-spacing: 0.5px;
         """)
         left_layout.addWidget(eeg_badge)
 
-        info_vbox = QVBoxLayout()
-        info_vbox.setSpacing(1)
-        info_vbox.setAlignment(Qt.AlignVCenter)
+        meta_layout = QVBoxLayout()
+        meta_layout.setSpacing(2)
+        meta_layout.setAlignment(Qt.AlignVCenter)
 
-        lbl_track_title = QLabel("PhysioNet S001 • Run 04")
-        lbl_track_title.setStyleSheet("color: #FFFFFF; font-size: 12px; font-weight: bold;")
-        lbl_track_sub = QLabel("Motor Imagery 64ch")
-        lbl_track_sub.setStyleSheet("color: #7A889B; font-size: 10px;")
+        title_lbl = QLabel("PhysioNet S001 • Run 04")
+        title_lbl.setStyleSheet("color: #FFFFFF; font-size: 12px; font-weight: bold;")
+        sub_lbl = QLabel("Motor Imagery 64ch • 160 Hz")
+        sub_lbl.setStyleSheet("color: #8C9BAE; font-size: 10px;")
 
-        info_vbox.addWidget(lbl_track_title)
-        info_vbox.addWidget(lbl_track_sub)
-        left_layout.addLayout(info_vbox)
+        meta_layout.addWidget(title_lbl)
+        meta_layout.addWidget(sub_lbl)
+        left_layout.addLayout(meta_layout)
 
-        layout.addLayout(left_layout)
+        layout.addLayout(left_layout, stretch=0)
+        layout.addSpacing(16)
 
-        # Center: Transport Controls (Top) + Timeline Bar (Bottom)
-        center_vbox = QVBoxLayout()
-        center_vbox.setSpacing(4)
-        center_vbox.setAlignment(Qt.AlignCenter)
+        # Center: Playback Controls & Interactive Timeline Bar
+        center_layout = QVBoxLayout()
+        center_layout.setSpacing(4)
+        center_layout.setAlignment(Qt.AlignCenter)
 
-        ctrl_row = QHBoxLayout()
-        ctrl_row.setSpacing(16)
-        ctrl_row.setAlignment(Qt.AlignCenter)
+        # Button row: Step Back (⏮), Play/Pause (▶), Step Forward (⏭)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(14)
+        btn_row.setAlignment(Qt.AlignCenter)
 
-        self.step_back_btn = QPushButton("⏮")
-        self.step_back_btn.setFixedSize(28, 28)
-        self.step_back_btn.setToolTip("Step Back (0.1s)")
-        self.step_back_btn.setStyleSheet("""
+        self.btn_prev = QPushButton("⏮")
+        self.btn_prev.setFixedSize(28, 28)
+        self.btn_prev.setToolTip("Step Back 1s")
+        self.btn_prev.setStyleSheet("""
             QPushButton {
-                background: #14171E;
-                color: #00E5FF;
-                font-size: 13px;
+                background: transparent;
+                color: #8C9BAE;
+                font-size: 14px;
                 border: none;
-                border-radius: 14px;
             }
             QPushButton:hover {
-                background: #1F2737;
+                color: #FFFFFF;
             }
         """)
-        self.step_back_btn.clicked.connect(lambda: self.engine.step(-int(self.data_loader.sfreq * 0.1)))
+        self.btn_prev.clicked.connect(lambda: self.engine.step_backward(1.0))
 
-        self.play_btn = QPushButton("▶")
-        self.play_btn.setFixedSize(36, 36)
-        self.play_btn.setToolTip("Play / Pause (Spacebar)")
-        self.play_btn.setStyleSheet("""
+        self.btn_play = QPushButton("▶")
+        self.btn_play.setFixedSize(34, 34)
+        self.btn_play.setToolTip("Play / Pause (Space)")
+        self.btn_play.setStyleSheet("""
             QPushButton {
                 background: #FFFFFF;
                 color: #000000;
-                font-size: 16px;
+                font-size: 14px;
+                border-radius: 17px;
                 font-weight: bold;
-                border-radius: 18px;
+                padding-left: 2px;
             }
             QPushButton:hover {
-                background: #E0E0E0;
-            }
-            QPushButton:pressed {
-                background: #B0B0B0;
+                background: #1DB954;
+                color: #000000;
             }
         """)
-        self.play_btn.clicked.connect(self.engine.toggle_play)
+        self.btn_play.clicked.connect(self.engine.toggle_play)
 
-        self.step_fwd_btn = QPushButton("⏭")
-        self.step_fwd_btn.setFixedSize(28, 28)
-        self.step_fwd_btn.setToolTip("Step Forward (0.1s)")
-        self.step_fwd_btn.setStyleSheet("""
+        self.btn_next = QPushButton("⏭")
+        self.btn_next.setFixedSize(28, 28)
+        self.btn_next.setToolTip("Step Forward 1s")
+        self.btn_next.setStyleSheet("""
             QPushButton {
-                background: #14171E;
-                color: #00E5FF;
-                font-size: 13px;
+                background: transparent;
+                color: #8C9BAE;
+                font-size: 14px;
                 border: none;
-                border-radius: 14px;
             }
             QPushButton:hover {
-                background: #1F2737;
+                color: #FFFFFF;
             }
         """)
-        self.step_fwd_btn.clicked.connect(lambda: self.engine.step(int(self.data_loader.sfreq * 0.1)))
+        self.btn_next.clicked.connect(lambda: self.engine.step_forward(1.0))
 
-        ctrl_row.addWidget(self.step_back_btn)
-        ctrl_row.addWidget(self.play_btn)
-        ctrl_row.addWidget(self.step_fwd_btn)
-        center_vbox.addLayout(ctrl_row)
+        btn_row.addWidget(self.btn_prev)
+        btn_row.addWidget(self.btn_play)
+        btn_row.addWidget(self.btn_next)
+        center_layout.addLayout(btn_row)
 
-        # Timeline row
+        # Timeline row: Time Elapsed + Timeline Plot + Total Duration
         time_row = QHBoxLayout()
-        time_row.setSpacing(10)
+        time_row.setSpacing(8)
 
-        self.cur_time_lbl = QLabel("0:00.000")
-        self.cur_time_lbl.setFixedWidth(62)
-        self.cur_time_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.cur_time_lbl.setStyleSheet("color: #8C9BAE; font-family: 'Consolas', monospace; font-size: 10px;")
+        self.time_cur_lbl = QLabel("0:00.000")
+        self.time_cur_lbl.setFixedWidth(52)
+        self.time_cur_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.time_cur_lbl.setStyleSheet("color: #8C9BAE; font-family: 'Consolas', monospace; font-size: 10px;")
 
-        self.timeline = SpotifyTimelineWidget(self.data_loader, parent=self, engine=self.engine)
+        self.timeline = SpotifyTimelineWidget(self.data_loader, self, engine=self.engine)
         self.timeline.seek_requested.connect(self.engine.seek_time)
 
-        tot_time = self.data_loader.duration
-        t_m = int(tot_time // 60)
-        t_s = tot_time % 60
-        self.tot_time_lbl = QLabel(f"{t_m}:{t_s:06.3f}")
-        self.tot_time_lbl.setFixedWidth(62)
-        self.tot_time_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.tot_time_lbl.setStyleSheet("color: #8C9BAE; font-family: 'Consolas', monospace; font-size: 10px;")
+        total_sec = self.data_loader.duration
+        mins = int(total_sec // 60)
+        secs = total_sec % 60
+        self.time_dur_lbl = QLabel(f"{mins}:{secs:06.3f}")
+        self.time_dur_lbl.setFixedWidth(52)
+        self.time_dur_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.time_dur_lbl.setStyleSheet("color: #8C9BAE; font-family: 'Consolas', monospace; font-size: 10px;")
 
-        time_row.addWidget(self.cur_time_lbl)
+        time_row.addWidget(self.time_cur_lbl)
         time_row.addWidget(self.timeline, stretch=1)
-        time_row.addWidget(self.tot_time_lbl)
+        time_row.addWidget(self.time_dur_lbl)
+        center_layout.addLayout(time_row)
 
-        center_vbox.addLayout(time_row)
-        layout.addLayout(center_vbox, stretch=1)
+        layout.addLayout(center_layout, stretch=1)
+        layout.addSpacing(16)
 
-        # Right: Stimulus Legend & Dynamic Readout
-        right_vbox = QVBoxLayout()
-        right_vbox.setSpacing(3)
-        right_vbox.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # Right: Stimulus Legend & Real-Time Active State
+        right_layout = QVBoxLayout()
+        right_layout.setSpacing(4)
+        right_layout.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        legend_lbl = QLabel(
-            "<span style='color: #00E5FF;'>●</span> Rest &nbsp;&nbsp; "
-            "<span style='color: #00FFA3;'>●</span> Left Fist &nbsp;&nbsp; "
-            "<span style='color: #BA68C8;'>●</span> Right Fist"
-        )
-        legend_lbl.setStyleSheet("font-size: 10px; color: #8C9BAE; font-weight: bold;")
-        legend_lbl.setAlignment(Qt.AlignRight)
+        legend_row = QHBoxLayout()
+        legend_row.setSpacing(8)
+        legend_row.setAlignment(Qt.AlignRight)
 
-        self.active_stim_lbl = QLabel("Active Stimulus: Rest")
-        self.active_stim_lbl.setStyleSheet("font-size: 11px; font-weight: bold; color: #00FFA3;")
-        self.active_stim_lbl.setAlignment(Qt.AlignRight)
+        for eid in ['T0', 'T1', 'T2']:
+            cfg = EVENT_COLOR_MAP[eid]
+            b_col = cfg['border']
+            n_str = cfg['name']
+            lbl = QLabel(f"<span style='color: {b_col};'>●</span> {n_str}")
+            lbl.setStyleSheet("color: #A0AEC0; font-size: 10px; font-weight: bold;")
+            legend_row.addWidget(lbl)
+        right_layout.addLayout(legend_row)
 
-        right_vbox.addWidget(legend_lbl)
-        right_vbox.addWidget(self.active_stim_lbl)
-        layout.addLayout(right_vbox)
+        self.stimulus_state_lbl = QLabel("Active Stimulus: Rest")
+        self.stimulus_state_lbl.setStyleSheet("""
+            color: #00E5FF;
+            font-size: 10px;
+            font-weight: bold;
+            background: #141A24;
+            border: 1px solid #1E2B3D;
+            border-radius: 3px;
+            padding: 2px 6px;
+        """)
+        right_layout.addWidget(self.stimulus_state_lbl, alignment=Qt.AlignRight)
 
-    def update_playback_state(self, is_playing: bool):
-        self.play_btn.setText("⏸" if is_playing else "▶")
+        layout.addLayout(right_layout, stretch=0)
 
-    def update_frame(self, current_sample: int, current_time: float):
-        cur_min = int(current_time // 60)
-        cur_sec = current_time % 60
-        self.cur_time_lbl.setText(f"{cur_min}:{cur_sec:06.3f}")
-        self.timeline.update_playhead(current_time)
+    def update_frame(self, sample_idx: int, t_sec: float):
+        mins = int(t_sec // 60)
+        secs = t_sec % 60
+        self.time_cur_lbl.setText(f"{mins}:{secs:06.3f}")
+        self.timeline.update_playhead(t_sec)
 
-        # Find current active stimulus
-        active_label = "Rest"
-        active_color = "#00FFA3"
+        active_ev = None
         for ev in self.data_loader.events:
-            if ev.start_time <= current_time <= ev.end_time:
-                active_label = ev.label
-                active_color = EVENT_COLOR_MAP.get(ev.event_id, {}).get('text', '#00FFA3')
+            if ev.start_time <= t_sec <= ev.end_time:
+                active_ev = ev
                 break
 
-        self.active_stim_lbl.setText(f"Active Stimulus: {active_label}")
-        self.active_stim_lbl.setStyleSheet(f"font-size: 11px; font-weight: bold; color: {active_color};")
+        if active_ev:
+            cfg = EVENT_COLOR_MAP.get(active_ev.event_id, {'name': active_ev.event_id, 'text': '#00FFA3', 'bg': '#0D332D', 'border': '#00FFA3'})
+            self.stimulus_state_lbl.setText(f"Active Stimulus: {cfg['name']}")
+            self.stimulus_state_lbl.setStyleSheet(f"""
+                color: {cfg['text']};
+                font-size: 10px;
+                font-weight: bold;
+                background: {cfg['bg']};
+                border: 1px solid {cfg['border']};
+                border-radius: 3px;
+                padding: 2px 6px;
+            """)
+        else:
+            self.stimulus_state_lbl.setText("Active Stimulus: Baseline")
+            self.stimulus_state_lbl.setStyleSheet("""
+                color: #7A889B;
+                font-size: 10px;
+                background: #14171E;
+                border: 1px solid #232B3B;
+                border-radius: 3px;
+                padding: 2px 6px;
+            """)
+
+    def update_playback_state(self, is_playing: bool):
+        if is_playing:
+            self.btn_play.setText("⏸")
+            self.btn_play.setStyleSheet("""
+                QPushButton {
+                    background: #1DB954;
+                    color: #000000;
+                    font-size: 14px;
+                    border-radius: 17px;
+                    font-weight: bold;
+                    padding-left: 0px;
+                }
+                QPushButton:hover {
+                    background: #23D260;
+                }
+            """)
+        else:
+            self.btn_play.setText("▶")
+            self.btn_play.setStyleSheet("""
+                QPushButton {
+                    background: #FFFFFF;
+                    color: #000000;
+                    font-size: 14px;
+                    border-radius: 17px;
+                    font-weight: bold;
+                    padding-left: 2px;
+                }
+                QPushButton:hover {
+                    background: #1DB954;
+                    color: #000000;
+                }
+            """)
 
 
 # ==============================================================================
-# TOP HEADER & COMPACT METADATA PILLS
+# HEADER WIDGET & SIDEBAR CONTROLS
 # ==============================================================================
 
 class HeaderWidget(QFrame):
@@ -1520,73 +1698,53 @@ class HeaderWidget(QFrame):
         self._init_ui()
 
     def _init_ui(self):
-        self.setFixedHeight(50)
+        self.setFixedHeight(48)
         self.setStyleSheet("""
             QFrame {
-                background: #0E0F14;
-                border-bottom: 1px solid #1A1F2B;
+                background: #060709;
+                border-bottom: 1px solid #14171E;
             }
         """)
-
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 6, 16, 6)
-        layout.setSpacing(14)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(16)
 
-        title_label = QLabel("neuromap")
-        title_label.setStyleSheet("color: #FFFFFF; font-size: 20px; font-weight: 800; letter-spacing: 1px;")
-        layout.addWidget(title_label)
+        logo = QLabel("NEUROMAP")
+        logo.setStyleSheet("color: #FFFFFF; font-size: 15px; font-weight: 900; letter-spacing: 2px;")
+        layout.addWidget(logo)
 
-        layout.addSpacing(16)
-
-        pills = [
-            ("SUBJ", self.data_loader.subject_id),
-            ("SRATE", f"{self.data_loader.sfreq:.0f} Hz"),
-            ("DURATION", f"{self.data_loader.duration:.1f} s"),
-            ("CHANNELS", f"{len(self.data_loader.channel_names)} EEG"),
-            ("TYPE", self.data_loader.file_type),
-            ("STATUS", self.data_loader.loaded_status)
-        ]
-
-        for tag, val in pills:
-            pill = QLabel(f"<span style='color: #6A788B; font-weight: bold;'>{tag}:</span> <span style='color: #E2E8F0;'>{val}</span>")
-            pill.setStyleSheet("""
-                background: #14171F;
-                border: 1px solid #202632;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 11px;
-            """)
-            layout.addWidget(pill)
+        tag = QLabel("RESEARCH SUITE v4.1")
+        tag.setStyleSheet("color: #00FFA3; background: #0D332D; border: 1px solid #00FFA3; border-radius: 3px; font-size: 9px; font-weight: bold; padding: 2px 6px;")
+        layout.addWidget(tag)
 
         layout.addStretch()
 
-        export_btn = QPushButton("⭳ Export Data")
-        export_btn.setStyleSheet("""
+        ch_badge = QLabel("64 Channels • 160Hz")
+        ch_badge.setStyleSheet("color: #8C9BAE; font-size: 11px;")
+        layout.addWidget(ch_badge)
+
+        btn_export = QPushButton("Export Filtered CSV")
+        btn_export.setStyleSheet("""
             QPushButton {
-                background: #1A2230;
-                color: #00E5FF;
-                border: 1px solid #00E5FF;
+                background: #14171E;
+                color: #DDE2EB;
+                border: 1px solid #232B3B;
                 border-radius: 4px;
-                padding: 6px 14px;
-                font-weight: bold;
+                padding: 4px 12px;
                 font-size: 11px;
+                font-weight: bold;
             }
             QPushButton:hover {
-                background: #00E5FF;
-                color: #0E0F14;
+                background: #1F2533;
+                border-color: #00FFA3;
+                color: #00FFA3;
             }
         """)
-        export_btn.clicked.connect(self.export_requested.emit)
-        layout.addWidget(export_btn)
+        btn_export.clicked.connect(self.export_requested.emit)
+        layout.addWidget(btn_export)
 
 
-# ==============================================================================
-# LEFT SIDEBAR CONTROLS
-# ==============================================================================
-
-class ControlSidebarWidget(QWidget):
-    settings_changed = pyqtSignal()
-
+class ControlSidebarWidget(QFrame):
     def __init__(self, data_loader: EEGDataLoader, engine: PlaybackEngine, parent=None):
         super().__init__(parent)
         self.data_loader = data_loader
@@ -1594,146 +1752,150 @@ class ControlSidebarWidget(QWidget):
         self._init_ui()
 
     def _init_ui(self):
-        self.setFixedWidth(260)
+        self.setFixedWidth(240)
+        self.setStyleSheet("""
+            QFrame {
+                background: #090A0E;
+                border-right: 1px solid #14171E;
+            }
+            QLabel {
+                color: #8C9BAE;
+                font-size: 11px;
+            }
+            QGroupBox {
+                border: 1px solid #181C26;
+                border-radius: 4px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-size: 11px;
+                font-weight: bold;
+                color: #00FFA3;
+            }
+        """)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        layout.setSpacing(14)
 
-        # Signal Processing Controls
-        lbl_sig = QLabel("SIGNAL PROCESSING")
-        lbl_sig.setStyleSheet("color: #7A889B; font-size: 11px; font-weight: bold; letter-spacing: 0.8px;")
-        layout.addWidget(lbl_sig)
+        sec_title = QLabel("PLAYBACK & DISPLAY")
+        sec_title.setStyleSheet("color: #00FFA3; font-size: 10px; font-weight: 900; letter-spacing: 1px;")
+        layout.addWidget(sec_title)
 
-        notch_box = QHBoxLayout()
-        self.chk_notch60 = QCheckBox("60 Hz Notch")
-        self.chk_notch60.setChecked(True)
-        self.chk_notch60.toggled.connect(self._on_notch_toggled)
-
-        self.chk_notch50 = QCheckBox("50 Hz Notch")
-        self.chk_notch50.setChecked(False)
-        self.chk_notch50.toggled.connect(self._on_notch_toggled)
-
-        notch_box.addWidget(self.chk_notch60)
-        notch_box.addWidget(self.chk_notch50)
-        layout.addLayout(notch_box)
-
-        hp_row = QHBoxLayout()
-        self.hp_slider = QSlider(Qt.Horizontal)
-        self.hp_slider.setRange(1, 20)
-        self.hp_slider.setValue(1)
-        self.hp_edit = QLineEdit("1.0")
-        self.hp_edit.setFixedWidth(45)
-        self.hp_slider.valueChanged.connect(self._on_hp_slider)
-        self.hp_edit.returnPressed.connect(self._on_hp_edit)
-        hp_row.addWidget(QLabel("HP:"))
-        hp_row.addWidget(self.hp_slider)
-        hp_row.addWidget(self.hp_edit)
-        hp_row.addWidget(QLabel("Hz"))
-        layout.addLayout(hp_row)
-
-        lp_row = QHBoxLayout()
-        self.lp_slider = QSlider(Qt.Horizontal)
-        self.lp_slider.setRange(20, 70)
-        self.lp_slider.setValue(40)
-        self.lp_edit = QLineEdit("40.0")
-        self.lp_edit.setFixedWidth(45)
-        self.lp_slider.valueChanged.connect(self._on_lp_slider)
-        self.lp_edit.returnPressed.connect(self._on_lp_edit)
-        lp_row.addWidget(QLabel("LP:"))
-        lp_row.addWidget(self.lp_slider)
-        lp_row.addWidget(self.lp_edit)
-        lp_row.addWidget(QLabel("Hz"))
-        layout.addLayout(lp_row)
-
-        layout.addSpacing(14)
-
-        # Display Controls
-        lbl_disp = QLabel("DISPLAY CONTROLS")
-        lbl_disp.setStyleSheet("color: #7A889B; font-size: 11px; font-weight: bold; letter-spacing: 0.8px;")
-        layout.addWidget(lbl_disp)
-
-        gain_row = QHBoxLayout()
-        self.gain_slider = QSlider(Qt.Horizontal)
-        self.gain_slider.setRange(20, 300)
-        self.gain_slider.setValue(100)
-        self.gain_edit = QLineEdit("100")
-        self.gain_edit.setFixedWidth(45)
-        self.gain_slider.valueChanged.connect(lambda v: self.gain_edit.setText(str(v)))
-        gain_row.addWidget(QLabel("Gain:"))
-        gain_row.addWidget(self.gain_slider)
-        gain_row.addWidget(self.gain_edit)
-        gain_row.addWidget(QLabel("µV"))
-        layout.addLayout(gain_row)
-
-        topo_row = QHBoxLayout()
-        self.topo_slider = QSlider(Qt.Horizontal)
-        self.topo_slider.setRange(20, 100)
-        self.topo_slider.setValue(50)
-        topo_row.addWidget(QLabel("Topomap:"))
-        topo_row.addWidget(self.topo_slider)
-        topo_row.addWidget(QLabel("±µV"))
-        layout.addLayout(topo_row)
-
-        win_row = QHBoxLayout()
-        self.win_slider = QSlider(Qt.Horizontal)
-        self.win_slider.setRange(2, 15)
-        self.win_slider.setValue(6)
-        self.win_edit = QLineEdit("6.0")
-        self.win_edit.setFixedWidth(45)
-        self.win_slider.valueChanged.connect(lambda v: self.win_edit.setText(f"{v:.1f}"))
-        win_row.addWidget(QLabel("Window:"))
-        win_row.addWidget(self.win_slider)
-        win_row.addWidget(self.win_edit)
-        win_row.addWidget(QLabel("s"))
-        layout.addLayout(win_row)
-
-        # Playback Speed (with 0.1x and 0.25x settings)
-        speed_row = QHBoxLayout()
+        # Speed Selector
+        speed_box = QHBoxLayout()
+        speed_lbl = QLabel("Speed:")
         self.speed_combo = QComboBox()
-        self.speed_combo.addItems(["0.1x", "0.25x", "0.5x", "1.0x", "1.5x", "2.0x", "4.0x"])
+        self.speed_combo.addItems(["0.5x", "1.0x", "1.5x", "2.0x", "4.0x"])
         self.speed_combo.setCurrentText("1.0x")
         self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
-        speed_row.addWidget(QLabel("Speed:"))
-        speed_row.addWidget(self.speed_combo)
-        layout.addLayout(speed_row)
+        speed_box.addWidget(speed_lbl)
+        speed_box.addWidget(self.speed_combo, stretch=1)
+        layout.addLayout(speed_box)
+
+        # Gain Slider
+        gain_box = QVBoxLayout()
+        self.gain_val_lbl = QLabel("Signal Gain: 1.0x")
+        self.gain_slider = QSlider(Qt.Horizontal)
+        self.gain_slider.setRange(2, 50)
+        self.gain_slider.setValue(10)
+        self.gain_slider.valueChanged.connect(self._on_gain_changed)
+        gain_box.addWidget(self.gain_val_lbl)
+        gain_box.addWidget(self.gain_slider)
+        layout.addLayout(gain_box)
+
+        # Time Window Slider
+        win_box = QVBoxLayout()
+        self.win_val_lbl = QLabel("Time Window: 4.0s")
+        self.win_slider = QSlider(Qt.Horizontal)
+        self.win_slider.setRange(1, 10)
+        self.win_slider.setValue(4)
+        self.win_slider.valueChanged.connect(self._on_win_changed)
+        win_box.addWidget(self.win_val_lbl)
+        win_box.addWidget(self.win_slider)
+        layout.addLayout(win_box)
+
+        # Topomap Scale Slider
+        topo_box = QVBoxLayout()
+        self.topo_val_lbl = QLabel("Topomap Limit: ±50 µV")
+        self.topo_slider = QSlider(Qt.Horizontal)
+        self.topo_slider.setRange(10, 150)
+        self.topo_slider.setValue(50)
+        self.topo_slider.valueChanged.connect(self._on_topo_changed)
+        topo_box.addWidget(self.topo_val_lbl)
+        topo_box.addWidget(self.topo_slider)
+        layout.addLayout(topo_box)
+
+        layout.addSpacing(8)
+
+        # DSP Filter Settings
+        filter_title = QLabel("DSP BANDPASS FILTERS")
+        filter_title.setStyleSheet("color: #00FFA3; font-size: 10px; font-weight: 900; letter-spacing: 1px;")
+        layout.addWidget(filter_title)
+
+        f_grid = QGridLayout()
+        f_grid.setSpacing(6)
+
+        f_grid.addWidget(QLabel("Low (Hz):"), 0, 0)
+        self.f_low = QLineEdit("1.0")
+        f_grid.addWidget(self.f_low, 0, 1)
+
+        f_grid.addWidget(QLabel("High (Hz):"), 1, 0)
+        self.f_high = QLineEdit("40.0")
+        f_grid.addWidget(self.f_high, 1, 1)
+
+        f_grid.addWidget(QLabel("Notch (Hz):"), 2, 0)
+        self.f_notch = QLineEdit("60.0")
+        f_grid.addWidget(self.f_notch, 2, 1)
+
+        layout.addLayout(f_grid)
+
+        btn_apply_filters = QPushButton("Apply Filters")
+        btn_apply_filters.setStyleSheet("""
+            QPushButton {
+                background: #14171E;
+                color: #00FFA3;
+                border: 1px solid #1F2737;
+                border-radius: 4px;
+                padding: 6px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #1F2737;
+                border-color: #00FFA3;
+            }
+        """)
+        btn_apply_filters.clicked.connect(self._on_apply_filters)
+        layout.addWidget(btn_apply_filters)
 
         layout.addStretch()
 
-    def _on_notch_toggled(self):
-        self.data_loader.notch_60 = self.chk_notch60.isChecked()
-        self.data_loader.notch_50 = self.chk_notch50.isChecked()
-        self.data_loader.apply_filters()
-        self.settings_changed.emit()
-
-    def _on_hp_slider(self, val):
-        self.hp_edit.setText(f"{val:.1f}")
-        self.data_loader.hp_freq = float(val)
-        self.data_loader.apply_filters()
-        self.settings_changed.emit()
-
-    def _on_hp_edit(self):
-        try:
-            val = float(self.hp_edit.text())
-            self.hp_slider.setValue(int(val))
-        except ValueError:
-            pass
-
-    def _on_lp_slider(self, val):
-        self.lp_edit.setText(f"{val:.1f}")
-        self.data_loader.lp_freq = float(val)
-        self.data_loader.apply_filters()
-        self.settings_changed.emit()
-
-    def _on_lp_edit(self):
-        try:
-            val = float(self.lp_edit.text())
-            self.lp_slider.setValue(int(val))
-        except ValueError:
-            pass
+        help_box = QLabel("Navigation:\n• Space: Play/Pause\n• Click 2D node: Observe ch\n• Scrub timeline to jump")
+        help_box.setStyleSheet("color: #4A5568; font-size: 10px; line-height: 14px;")
+        layout.addWidget(help_box)
 
     def _on_speed_changed(self, text: str):
-        val = float(text.replace('x', ''))
-        self.engine.set_speed(val)
+        speed_map = {"0.5x": 0.5, "1.0x": 1.0, "1.5x": 1.5, "2.0x": 2.0, "4.0x": 4.0}
+        self.engine.set_speed(speed_map.get(text, 1.0))
+
+    def _on_gain_changed(self, val: int):
+        gain = val / 10.0
+        self.gain_val_lbl.setText(f"Signal Gain: {gain:.1f}x")
+
+    def _on_win_changed(self, val: int):
+        self.win_val_lbl.setText(f"Time Window: {val:.1f}s")
+
+    def _on_topo_changed(self, val: int):
+        self.topo_val_lbl.setText(f"Topomap Limit: ±{val} µV")
+
+    def _on_apply_filters(self):
+        try:
+            l_val = float(self.f_low.text())
+            h_val = float(self.f_high.text())
+            n_val = float(self.f_notch.text())
+            self.data_loader.apply_dsp_filters(l_val, h_val, n_val)
+        except ValueError:
+            print("[WARN] Invalid DSP filter parameters entered.")
 
 
 # ==============================================================================
@@ -1742,13 +1904,12 @@ class ControlSidebarWidget(QWidget):
 
 class NeuromapMainWindow(QMainWindow):
     """
-    Main Application Window:
-    - Top row (QSplitter):
-      * Left: TopomapContainerWidget (Toggleable 2D Map / 3D Brain)
-      * Right: AnalysisPanelWidget (Clean workstation placeholder)
-    - Middle/Bottom section: Cascading Multi-Track Waveforms
-    - Bottom Dock: Phase 2 Spotify Playback Bar Format
-    - Auto-launches Maximized
+    Neuromap Main Dashboard Window:
+    - Layout Swapped:
+      * Top-Left: Analysis Workstation Panel (clean placeholder for Phase 5 modules)
+      * Top-Right: Topomap Viewport (Toggle between 2D Topomap and 3D Brain)
+    - Middle/Bottom: Cascading Raw Waveforms
+    - Bottom Dock: Spotify Playback Bar
     """
     def __init__(self):
         super().__init__()
@@ -1786,17 +1947,18 @@ class NeuromapMainWindow(QMainWindow):
         self.main_splitter = QSplitter(Qt.Vertical)
         self.main_splitter.setHandleWidth(4)
 
-        # Top Row (Horizontal Splitter: Topomap Viewport + Analysis Panel)
+        # Top Row (Horizontal Splitter: Analysis Workstation on LEFT, Topomap Viewport on RIGHT)
         self.top_splitter = QSplitter(Qt.Horizontal)
         self.top_splitter.setHandleWidth(4)
 
-        # Top-Left: Toggleable Topomap Container (2D Map / 3D Brain)
-        self.topomap_container = TopomapContainerWidget(self.data_loader, self)
-        # Top-Right: Analysis Workstation Panel
+        # Top-Left: Analysis Workstation Panel (Swapped to Left)
         self.analysis_panel = AnalysisPanelWidget(self)
-
-        self.top_splitter.addWidget(self.topomap_container)
         self.top_splitter.addWidget(self.analysis_panel)
+
+        # Top-Right: Toggleable Topomap Container (Swapped to Right)
+        self.topomap_container = TopomapContainerWidget(self.data_loader, self)
+        self.top_splitter.addWidget(self.topomap_container)
+
         self.top_splitter.setSizes([960, 960])
         self.main_splitter.addWidget(self.top_splitter)
 
@@ -1926,8 +2088,9 @@ class NeuromapMainWindow(QMainWindow):
         if self.topomap_container.current_mode == "2D":
             self.topomap_container.widget_2d.update_voltage_frame(current_sample)
         else:
-            voltages_64 = self.data_loader.filtered_data[:len(self.topomap_container.widget_2d.valid_ch_names), current_sample]
-            self.topomap_container.widget_3d.update_voltage_frame(voltages_64, self.topomap_container.widget_2d.v_scale)
+            if self.topomap_container.widget_3d is not None and self.topomap_container.widget_3d.is_active:
+                voltages_64 = self.data_loader.filtered_data[:len(self.topomap_container.widget_3d.valid_ch_names), current_sample]
+                self.topomap_container.widget_3d.update_voltage_frame(voltages_64, self.topomap_container.widget_2d.v_scale)
 
         # 2. Update Cascading Waveforms
         self.waveforms_widget.update_frame(current_sample)
@@ -1936,21 +2099,24 @@ class NeuromapMainWindow(QMainWindow):
         self.playback_bar.update_frame(current_sample, current_time)
 
     def _on_channel_toggled(self, ch_name: str, is_active: bool):
-        selected_list = sorted(list(self.topomap_container.widget_2d.selected_channels))
+        selected_set = self.topomap_container.widget_2d.selected_channels
+        selected_list = sorted(list(selected_set))
         self.waveforms_widget.set_active_channels(selected_list)
-        self.topomap_container.widget_3d.set_selected_channels(self.topomap_container.widget_2d.selected_channels)
-        self.topomap_container.status_ch_lbl.setText(f"{len(selected_list)} of 64 Active")
+        if self.topomap_container.widget_3d is not None:
+            self.topomap_container.widget_3d.set_selected_channels(selected_set)
+        self.topomap_container.update_active_badge(len(selected_list))
         self.status_label.setText(f"Status: {len(selected_list)} of 64 channels selected ({', '.join(selected_list[:6]) if selected_list else 'None'})")
 
     def _on_gain_changed(self, val: int):
-        self.waveforms_widget.gain = float(val)
+        self.waveforms_widget.gain = float(val) / 10.0
 
     def _on_window_changed(self, val: int):
         self.waveforms_widget.update_window(float(val))
 
     def _on_topo_scale_changed(self, val: int):
         self.topomap_container.widget_2d.v_scale = float(val)
-        self.topomap_container.widget_3d.set_clim(float(val))
+        if self.topomap_container.widget_3d is not None:
+            self.topomap_container.widget_3d.set_clim(float(val))
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
