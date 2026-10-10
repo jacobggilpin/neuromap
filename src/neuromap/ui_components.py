@@ -1,46 +1,64 @@
 """
-neuromap - UI Components Architecture
+neuromap - UI Components Architecture (Phase 4.03)
 Targeted for 1920x1200 Display | High-DPI | Dark Modern Theme
 
 Components:
-- WaveformsWidget: Cascading raw EEG scrolling traces for selected channels using Phase 4.03 sliding window slicing.
-- SpotifyTimelineWidget: Interactive timeline with continuous Global Field Power (GFP) mini-map & stimulus markers.
-- SpotifyPlaybackBar: Transport bar with frame-by-frame stepping (1 sample = 6.25ms @ 160Hz), NoFocus policy,
-  and speeds strictly limited to [0.1x, 0.25x, 0.5x, 1.0x].
-- HeaderWidget: Branding, export tools, and Live LSL Hardware Stream indicator.
-- ControlSidebarWidget: Collapsible control panel (240px <-> 36px) with speed, gain, window, and BCI intent quick meters.
+- WaveformsWidget: Cascading raw EEG scrolling traces for selected channels.
+- SpotifyTimelineWidget: Interactive timeline with continuous Global Field Power (GFP) envelope mini-map.
+- SpotifyPlaybackBar: Transport bar with step backward/forward (1s), NoFocus policy, and speeds [0.1x, 0.25x, 0.5x, 1.0x].
+- HeaderWidget: Branding, channel count, and CSV export.
+- ControlSidebarWidget: Collapsible panel (240px <-> 36px) with speed, gain, window, topomap limit, and FastICA controls.
 """
 
 from typing import Dict, List, Tuple, Optional, Set
 import numpy as np
 
-# PyQt5 GUI Framework
-try:
-    from PyQt5.QtCore import Qt, pyqtSignal, QPointF, QRectF
-    from PyQt5.QtGui import QColor, QFont, QPen, QBrush, QPainter
-    from PyQt5.QtWidgets import (
-        QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-        QSlider, QComboBox, QCheckBox, QFrame, QSizePolicy
-    )
-    import pyqtgraph as pg
-except ImportError:
-    pass
-
-from config import (
-    STANDARD_64_CHANNELS, EVENT_COLOR_MAP, StimulusEvent
+from PyQt5.QtCore import Qt, pyqtSignal, QPointF, QRectF
+from PyQt5.QtGui import QColor, QFont, QPen, QBrush, QPainter
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
+    QSlider, QLineEdit, QComboBox, QCheckBox, QFrame, QSizePolicy
 )
-from engine import EEGDataLoader, PlaybackEngine
-
+import pyqtgraph as pg
 
 # ==============================================================================
-# CASCADING RAW EEG WAVEFORMS WIDGET
+# AUTOMATIC PATH BOOTSTRAP (Supports root execution, src/neuromap layout & VS Code)
+# ==============================================================================
+import sys
+from pathlib import Path
+_root = Path(__file__).resolve().parent
+for _cand in [
+    _root / 'src' / 'neuromap',
+    _root / 'src',
+    _root,
+    _root.parent / 'src' / 'neuromap',
+    _root.parent / 'src',
+    _root.parent,
+]:
+    _cand_str = str(_cand)
+    if _cand.is_dir() and _cand_str not in sys.path:
+        sys.path.insert(0, _cand_str)
+
+try:
+    from neuromap.config import (
+        STANDARD_64_CHANNELS, EVENT_COLOR_MAP, StimulusEvent
+    )
+    from neuromap.engine import EEGDataLoader, PlaybackEngine
+except (ImportError, ModuleNotFoundError):
+    from config import (
+        STANDARD_64_CHANNELS, EVENT_COLOR_MAP, StimulusEvent
+    )
+    from engine import EEGDataLoader, PlaybackEngine
+
+# ==============================================================================
+# CASCADING WAVEFORMS WIDGET (DISPLAYED IN MIDDLE/BOTTOM WORKSPACE)
 # ==============================================================================
 
 class WaveformsWidget(QWidget):
     """
     Cascading Multi-Channel Raw EEG Waveforms:
     - Renders ONLY user-selected channels (starts with 0 active on launch).
-    - Phase 4.03 standard sliding window slicing via EEGDataLoader.get_window_data.
+    - Features dedicated header: '● RAW EEG WAVEFORMS' + active channel badge.
     - Zero font metric recalculation in render loop (avoids GraphicsView jitter).
     - Precomputed timeline X-axis buffer for 60+ FPS performance.
     """
@@ -142,7 +160,14 @@ class WaveformsWidget(QWidget):
         if len(self.active_channels) == 0:
             return
 
-        n_pts = int(self.window_sec * self.data_loader.sfreq)
+        cur_t = current_sample / self.data_loader.sfreq
+        t_start = max(0.0, cur_t - self.window_sec)
+        t_end = cur_t
+
+        s_start = int(t_start * self.data_loader.sfreq)
+        s_end = int(t_end * self.data_loader.sfreq)
+        n_pts = s_end - s_start
+
         if n_pts <= 1:
             return
 
@@ -156,118 +181,125 @@ class WaveformsWidget(QWidget):
         for idx, ch in enumerate(self.active_channels):
             if ch in self.data_loader.channel_names and ch in self.curve_items:
                 ch_idx = self.data_loader.channel_names.index(ch)
-                chunk = self.data_loader.get_window_data(ch_idx, current_sample, n_pts)
+                chunk = self.data_loader.filtered_data[ch_idx, s_start:s_end]
                 y_offset = idx * y_spacing
                 scaled_y = (chunk * self.gain) + y_offset
                 self.curve_items[ch].setData(self.cached_t_axis, scaled_y)
 
 
 # ==============================================================================
-# SPOTIFY TIMELINE WIDGET (GFP MINI-MAP & SCRUBBER)
+# SPOTIFY PLAYBACK BAR WITH MINI-MAP TIMELINE NAVIGATION
 # ==============================================================================
 
 class SpotifyTimelineWidget(pg.PlotWidget):
     """
     Spotify-Style Interactive Timeline with GFP Mini-Map Waveform Navigation:
-    - Renders continuous Global Field Power (GFP) envelope across the dataset.
+    - Renders the continuous Global Field Power (GFP) envelope across the entire dataset.
     - Overlays colored stimulus event regions (T0 Rest, T1 Left Fist, T2 Right Fist).
-    - Prominent bold playhead scrubber line (width=3.5).
+    - Scrubbing moves the white playhead line and smoothly seeks playback.
     """
     seek_requested = pyqtSignal(float)
 
     def __init__(self, data_loader: EEGDataLoader, parent=None, engine=None):
         super().__init__(parent=parent)
         self.data_loader = data_loader
-        self.engine = engine
-        self._is_scrubbing = False
+        self.engine = engine if engine is not None else getattr(parent, 'engine', None)
+        self.is_dragging = False
+
+        self.upper_curve = None
+        self.lower_curve = None
 
         self._init_ui()
 
     def _init_ui(self):
-        self.setBackground('#08080C')
-        self.setFixedHeight(24)
+        self.setBackground('#0E0F14')
+        self.setFixedHeight(28)
         self.hideAxis('left')
         self.hideAxis('bottom')
         self.setMouseEnabled(x=False, y=False)
+        self.setXRange(0.0, self.data_loader.duration, padding=0.005)
+        self.setYRange(-0.5, 0.5)
 
-        total_duration = max(1.0, self.data_loader.duration)
-        self.setXRange(0.0, total_duration, padding=0.0)
-        self.setYRange(-0.5, 0.5, padding=0.0)
+        # Baseline rail (Z=0)
+        rail = pg.PlotCurveItem([0.0, self.data_loader.duration], [0.0, 0.0], pen=pg.mkPen('#1C222E', width=4.0))
+        rail.setZValue(0)
+        self.addItem(rail)
 
-        # Draw Stimulus Region Boxes
-        for ev in self.data_loader.events:
-            color_hex = EVENT_COLOR_MAP.get(ev.event_id, {}).get('bg', '#1E2530')
-            lr = pg.LinearRegionItem(
-                [ev.start_time, ev.end_time],
-                movable=False,
-                brush=pg.mkBrush(color_hex)
-            )
-            lr.setLinesPen(pg.mkPen(0, 0, 0, 0))
-            self.addItem(lr)
-
-        # Continuous GFP Waveform Envelope Mini-Map
-        self.gfp_curve = pg.PlotDataItem(pen=pg.mkPen('#2A3548', width=1.0))
-        self.addItem(self.gfp_curve)
-        self.refresh_minimap()
-
-        # Prominent Playhead Scrubber Line (width=3.5)
-        self.playhead = pg.InfiniteLine(
-            pos=0.0,
-            angle=90,
-            pen=pg.mkPen('#00FFA3', width=3.5),
-            movable=False
-        )
-        self.addItem(self.playhead)
-
-    def refresh_minimap(self):
+        # Mini-Map Waveform Envelope (Z=1)
         if self.data_loader.gfp_envelope is not None:
             t_axis = np.linspace(0.0, self.data_loader.duration, len(self.data_loader.gfp_envelope))
-            self.gfp_curve.setData(t_axis, self.data_loader.gfp_envelope)
+            gfp_y = self.data_loader.gfp_envelope
+            self.upper_curve = pg.PlotCurveItem(t_axis, gfp_y, fillLevel=0.0, brush=pg.mkBrush('#142232'), pen=pg.mkPen('#21344B', width=1.0))
+            self.upper_curve.setZValue(1)
+            self.addItem(self.upper_curve)
+
+            self.lower_curve = pg.PlotCurveItem(t_axis, -gfp_y, fillLevel=0.0, brush=pg.mkBrush('#142232'), pen=pg.mkPen('#21344B', width=1.0))
+            self.lower_curve.setZValue(1)
+            self.addItem(self.lower_curve)
+
+        # Event regions (Z=2)
+        for ev in self.data_loader.events:
+            cfg = EVENT_COLOR_MAP.get(ev.event_id, {'bg': '#1E2530', 'border': '#7A889B'})
+            brush_c = QColor(cfg['bg'])
+            brush_c.setAlpha(160)
+            region = pg.LinearRegionItem(
+                [ev.start_time, ev.end_time], movable=False,
+                brush=QBrush(brush_c), pen=pg.mkPen(cfg['border'], width=1.0)
+            )
+            region.setZValue(2)
+            self.addItem(region)
+
+        # Prominent Thicker Playhead Cursor Line (Z=5, width=3.5)
+        self.playhead_line = pg.InfiniteLine(
+            pos=0.0, angle=90, movable=False,
+            pen=pg.mkPen('#FFFFFF', width=3.5)
+        )
+        self.playhead_line.setZValue(5)
+        self.addItem(self.playhead_line)
+
+    def refresh_minimap(self):
+        """Updates the GFP waveform envelope curves when filtering or FastICA changes."""
+        if self.upper_curve is not None and self.data_loader.gfp_envelope is not None:
+            t_axis = np.linspace(0.0, self.data_loader.duration, len(self.data_loader.gfp_envelope))
+            gfp_y = self.data_loader.gfp_envelope
+            self.upper_curve.setData(t_axis, gfp_y)
+            self.lower_curve.setData(t_axis, -gfp_y)
 
     def update_playhead(self, time_sec: float):
-        if not self._is_scrubbing:
-            self.playhead.setPos(time_sec)
+        if not self.is_dragging:
+            self.playhead_line.setValue(time_sec)
 
     def mousePressEvent(self, ev):
         if ev.button() == Qt.LeftButton:
-            self._is_scrubbing = True
+            self.is_dragging = True
             self._handle_scrub(ev.pos().x())
-            ev.accept()
-        else:
-            super().mousePressEvent(ev)
+        super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
-        if self._is_scrubbing:
+        if self.is_dragging:
             self._handle_scrub(ev.pos().x())
-            ev.accept()
-        else:
-            super().mouseMoveEvent(ev)
+        super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
         if ev.button() == Qt.LeftButton:
-            self._is_scrubbing = False
+            self.is_dragging = False
             self._handle_scrub(ev.pos().x())
-            ev.accept()
-        else:
-            super().mouseReleaseEvent(ev)
+        super().mouseReleaseEvent(ev)
 
     def _handle_scrub(self, mouse_x: float):
-        w = max(1, self.width())
-        frac = max(0.0, min(1.0, mouse_x / float(w)))
-        target_time = frac * self.data_loader.duration
-        self.playhead.setPos(target_time)
-        self.seek_requested.emit(target_time)
+        width = self.width()
+        if width > 0:
+            frac = max(0.0, min(1.0, mouse_x / width))
+            t_sec = frac * self.data_loader.duration
+            self.playhead_line.setValue(t_sec)
+            self.seek_requested.emit(t_sec)
 
-
-# ==============================================================================
-# SPOTIFY PLAYBACK BAR (FRAME-BY-FRAME STEPPING & NO FOCUS HIGHLIGHT)
-# ==============================================================================
 
 class SpotifyPlaybackBar(QFrame):
     """
-    Bottom Dock: Spotify Playback Bar with Frame-by-Frame Stepping & GFP Mini-Map
+    Spotify-Style Transport Bar matching Phase 2 Format:
     - Left: [EEG] badge + 'PhysioNet S001 • Run 04' / 'Motor Imagery 64ch'
-    - Center Top: Step Back 1 Frame (⏮), Circular Play/Pause (▶), Step Forward 1 Frame (⏭)
+    - Center Top: Step Back (⏮), White Circular Play/Pause (▶), Step Forward (⏭)
     - Center Bottom: '0:00.000' + Full Interactive Timeline + '2:04.994'
     - Right: '• Rest  • Left Fist  • Right Fist' legend + 'Active Stimulus: Rest'
     """
@@ -334,7 +366,7 @@ class SpotifyPlaybackBar(QFrame):
         btn_row.setSpacing(14)
         btn_row.setAlignment(Qt.AlignCenter)
 
-        # Frame-by-Frame Backward (1 sample = 6.25ms @ 160Hz) with NoFocus
+        # Frame-by-Frame Backward (1 sample / 6.25ms @ 160Hz) with NoFocus
         self.btn_prev = QPushButton("⏮")
         self.btn_prev.setFixedSize(28, 28)
         self.btn_prev.setToolTip("Previous Frame (1 sample / 6.25ms) [Left Arrow]")
@@ -347,8 +379,18 @@ class SpotifyPlaybackBar(QFrame):
                 border: none;
                 outline: none;
             }
-            QPushButton:hover { color: #FFFFFF; }
-            QPushButton:pressed { color: #00FFA3; }
+            QPushButton:hover {
+                color: #FFFFFF;
+                background: transparent;
+            }
+            QPushButton:pressed {
+                color: #00FFA3;
+                background: transparent;
+            }
+            QPushButton:focus {
+                outline: none;
+                border: none;
+            }
         """)
         self.btn_prev.clicked.connect(lambda: self.engine.step_frame_backward(1))
 
@@ -368,12 +410,22 @@ class SpotifyPlaybackBar(QFrame):
                 border: none;
                 outline: none;
             }
-            QPushButton:hover { background: #1DB954; color: #000000; }
-            QPushButton:pressed { background: #179B46; color: #000000; }
+            QPushButton:hover {
+                background: #1DB954;
+                color: #000000;
+            }
+            QPushButton:pressed {
+                background: #179B46;
+                color: #000000;
+            }
+            QPushButton:focus {
+                outline: none;
+                border: none;
+            }
         """)
         self.btn_play.clicked.connect(self.engine.toggle_play)
 
-        # Frame-by-Frame Forward (1 sample = 6.25ms @ 160Hz) with NoFocus
+        # Frame-by-Frame Forward (1 sample / 6.25ms @ 160Hz) with NoFocus
         self.btn_next = QPushButton("⏭")
         self.btn_next.setFixedSize(28, 28)
         self.btn_next.setToolTip("Next Frame (1 sample / 6.25ms) [Right Arrow]")
@@ -386,8 +438,18 @@ class SpotifyPlaybackBar(QFrame):
                 border: none;
                 outline: none;
             }
-            QPushButton:hover { color: #FFFFFF; }
-            QPushButton:pressed { color: #00FFA3; }
+            QPushButton:hover {
+                color: #FFFFFF;
+                background: transparent;
+            }
+            QPushButton:pressed {
+                color: #00FFA3;
+                background: transparent;
+            }
+            QPushButton:focus {
+                outline: none;
+                border: none;
+            }
         """)
         self.btn_next.clicked.connect(lambda: self.engine.step_frame_forward(1))
 
@@ -396,65 +458,72 @@ class SpotifyPlaybackBar(QFrame):
         btn_row.addWidget(self.btn_next)
         center_layout.addLayout(btn_row)
 
-        # Timeline Scrubber Row
+        # Timeline row: Time Elapsed + Timeline Plot + Total Duration
         time_row = QHBoxLayout()
         time_row.setSpacing(8)
 
-        self.lbl_time_cur = QLabel("0:00.000")
-        self.lbl_time_cur.setFixedWidth(56)
-        self.lbl_time_cur.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.lbl_time_cur.setStyleSheet("color: #8C9BAE; font-family: 'Consolas', monospace; font-size: 10px;")
+        self.time_cur_lbl = QLabel("0:00.000")
+        self.time_cur_lbl.setFixedWidth(52)
+        self.time_cur_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.time_cur_lbl.setStyleSheet("color: #8C9BAE; font-family: 'Consolas', monospace; font-size: 10px;")
 
-        self.timeline_widget = SpotifyTimelineWidget(self.data_loader, self, engine=self.engine)
-        self.timeline_widget.seek_requested.connect(self.engine.seek_time)
+        self.timeline = SpotifyTimelineWidget(self.data_loader, self, engine=self.engine)
+        self.timeline.seek_requested.connect(self.engine.seek_time)
 
-        tot_m = int(self.data_loader.duration) // 60
-        tot_s = self.data_loader.duration % 60.0
-        self.lbl_time_tot = QLabel(f"{tot_m}:{tot_s:06.3f}")
-        self.lbl_time_tot.setFixedWidth(56)
-        self.lbl_time_tot.setStyleSheet("color: #8C9BAE; font-family: 'Consolas', monospace; font-size: 10px;")
+        total_sec = self.data_loader.duration
+        mins = int(total_sec // 60)
+        secs = total_sec % 60
+        self.time_dur_lbl = QLabel(f"{mins}:{secs:06.3f}")
+        self.time_dur_lbl.setFixedWidth(52)
+        self.time_dur_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.time_dur_lbl.setStyleSheet("color: #8C9BAE; font-family: 'Consolas', monospace; font-size: 10px;")
 
-        time_row.addWidget(self.lbl_time_cur)
-        time_row.addWidget(self.timeline_widget, stretch=1)
-        time_row.addWidget(self.lbl_time_tot)
+        time_row.addWidget(self.time_cur_lbl)
+        time_row.addWidget(self.timeline, stretch=1)
+        time_row.addWidget(self.time_dur_lbl)
         center_layout.addLayout(time_row)
 
         layout.addLayout(center_layout, stretch=1)
         layout.addSpacing(16)
 
-        # Right: Stimulus Legend & Current State
+        # Right: Stimulus Legend & Real-Time Active State
         right_layout = QVBoxLayout()
         right_layout.setSpacing(4)
-        right_layout.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+        right_layout.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         legend_row = QHBoxLayout()
-        legend_row.setSpacing(10)
+        legend_row.setSpacing(8)
+        legend_row.setAlignment(Qt.AlignRight)
 
-        for eid, m in EVENT_COLOR_MAP.items():
-            item_lbl = QLabel(f"<span style='color: {m['dot']};'>●</span> {m['name']}")
-            item_lbl.setStyleSheet("color: #8C9BAE; font-size: 10px; font-weight: bold;")
-            legend_row.addWidget(item_lbl)
-
+        for eid in ['T0', 'T1', 'T2']:
+            cfg = EVENT_COLOR_MAP[eid]
+            b_col = cfg['border']
+            n_str = cfg['name']
+            lbl = QLabel(f"<span style='color: {b_col};'>●</span> {n_str}")
+            lbl.setStyleSheet("color: #A0AEC0; font-size: 10px; font-weight: bold;")
+            legend_row.addWidget(lbl)
         right_layout.addLayout(legend_row)
 
-        self.active_stim_lbl = QLabel("Active Stimulus: Rest")
-        self.active_stim_lbl.setAlignment(Qt.AlignRight)
-        self.active_stim_lbl.setStyleSheet("""
+        self.stimulus_state_lbl = QLabel("Active Stimulus: Rest")
+        self.stimulus_state_lbl.setStyleSheet("""
             color: #00E5FF;
-            font-size: 11px;
+            font-size: 10px;
             font-weight: bold;
+            background: #141A24;
+            border: 1px solid #1E2B3D;
+            border-radius: 3px;
+            padding: 2px 6px;
         """)
-        right_layout.addWidget(self.active_stim_lbl)
+        right_layout.addWidget(self.stimulus_state_lbl, alignment=Qt.AlignRight)
 
         layout.addLayout(right_layout, stretch=0)
 
     def update_frame(self, sample_idx: int, t_sec: float):
-        m = int(t_sec) // 60
-        s = t_sec % 60.0
-        self.lbl_time_cur.setText(f"{m}:{s:06.3f}")
-        self.timeline_widget.update_playhead(t_sec)
+        mins = int(t_sec // 60)
+        secs = t_sec % 60
+        self.time_cur_lbl.setText(f"{mins}:{secs:06.3f}")
+        self.timeline.update_playhead(t_sec)
 
-        # Identify Active Stimulus Event
         active_ev = None
         for ev in self.data_loader.events:
             if ev.start_time <= t_sec <= ev.end_time:
@@ -462,24 +531,76 @@ class SpotifyPlaybackBar(QFrame):
                 break
 
         if active_ev:
-            color = EVENT_COLOR_MAP.get(active_ev.event_id, {}).get('dot', '#00FFA3')
-            self.active_stim_lbl.setText(f"Active Stimulus: {active_ev.label}")
-            self.active_stim_lbl.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: bold;")
+            cfg = EVENT_COLOR_MAP.get(active_ev.event_id, {'name': active_ev.event_id, 'text': '#00FFA3', 'bg': '#0D332D', 'border': '#00FFA3'})
+            self.stimulus_state_lbl.setText(f"Active Stimulus: {cfg['name']}")
+            self.stimulus_state_lbl.setStyleSheet(f"""
+                color: {cfg['text']};
+                font-size: 10px;
+                font-weight: bold;
+                background: {cfg['bg']};
+                border: 1px solid {cfg['border']};
+                border-radius: 3px;
+                padding: 2px 6px;
+            """)
         else:
-            self.active_stim_lbl.setText("Active Stimulus: Inter-Trial Interval")
-            self.active_stim_lbl.setStyleSheet("color: #4A5568; font-size: 11px; font-weight: bold;")
+            self.stimulus_state_lbl.setText("Active Stimulus: Baseline")
+            self.stimulus_state_lbl.setStyleSheet("""
+                color: #7A889B;
+                font-size: 10px;
+                background: #14171E;
+                border: 1px solid #232B3B;
+                border-radius: 3px;
+                padding: 2px 6px;
+            """)
 
     def update_playback_state(self, is_playing: bool):
         if is_playing:
             self.btn_play.setText("⏸")
-            self.btn_play.setToolTip("Pause (Space)")
+            self.btn_play.setStyleSheet("""
+                QPushButton {
+                    background: #1DB954;
+                    color: #000000;
+                    font-size: 14px;
+                    border-radius: 17px;
+                    font-weight: bold;
+                    padding-left: 0px;
+                    border: none;
+                    outline: none;
+                }
+                QPushButton:hover {
+                    background: #23D260;
+                }
+                QPushButton:focus {
+                    outline: none;
+                    border: none;
+                }
+            """)
         else:
             self.btn_play.setText("▶")
-            self.btn_play.setToolTip("Play (Space)")
+            self.btn_play.setStyleSheet("""
+                QPushButton {
+                    background: #FFFFFF;
+                    color: #000000;
+                    font-size: 14px;
+                    border-radius: 17px;
+                    font-weight: bold;
+                    padding-left: 2px;
+                    border: none;
+                    outline: none;
+                }
+                QPushButton:hover {
+                    background: #1DB954;
+                    color: #000000;
+                }
+                QPushButton:focus {
+                    outline: none;
+                    border: none;
+                }
+            """)
 
 
 # ==============================================================================
-# HEADER WIDGET
+# HEADER WIDGET & COLLAPSIBLE CONTROL SIDEBAR (WITH FASTICA CONTROLS)
 # ==============================================================================
 
 class HeaderWidget(QFrame):
@@ -507,13 +628,13 @@ class HeaderWidget(QFrame):
         logo.setStyleSheet("color: #FFFFFF; font-size: 15px; font-weight: 900; letter-spacing: 2px;")
         layout.addWidget(logo)
 
-        tag = QLabel("RESEARCH SUITE v5.0 (PHASE 5 ANALYTICS)")
+        tag = QLabel("RESEARCH SUITE v4.03")
         tag.setStyleSheet("color: #00FFA3; background: #0D332D; border: 1px solid #00FFA3; border-radius: 3px; font-size: 9px; font-weight: bold; padding: 2px 6px;")
         layout.addWidget(tag)
 
         layout.addStretch()
 
-        ch_badge = QLabel("64 Channels • 160Hz • Closed-Loop")
+        ch_badge = QLabel("64 Channels • 160Hz")
         ch_badge.setStyleSheet("color: #8C9BAE; font-size: 11px;")
         layout.addWidget(ch_badge)
 
@@ -538,17 +659,15 @@ class HeaderWidget(QFrame):
         layout.addWidget(btn_export)
 
 
-# ==============================================================================
-# COLLAPSIBLE CONTROL SIDEBAR
-# ==============================================================================
-
 class ControlSidebarWidget(QFrame):
     """
-    Collapsible Control Sidebar:
-    - Speed selector strictly limited to [0.1x, 0.25x, 0.5x, 1.0x].
-    - FastICA & ASR Quick Controls.
-    - Quick BCI Intent readout.
-    - Collapsible from 240px to 36px (F4).
+    Phase 4.03 Collapsible Control Sidebar:
+    - Speed selector limited to [0.1x, 0.25x, 0.5x, 1.0x].
+    - Dynamic FastICA Artifact Removal Section:
+      * [x] Enable ICA Cleaning
+      * Artifact Mode Preset (IC0 Blinks, IC0+IC1 Saccades, IC0+IC1+IC2 EMG)
+      * ⚡ Re-compute FastICA Button
+    - Collapsible from 240px to 36px.
     """
     def __init__(self, data_loader: EEGDataLoader, engine: PlaybackEngine, parent=None):
         super().__init__(parent)
@@ -612,24 +731,28 @@ class ControlSidebarWidget(QFrame):
                 color: #00FFA3;
                 border-color: #00FFA3;
             }
+            QPushButton:focus {
+                outline: none;
+            }
         """)
         self.btn_toggle.clicked.connect(self.toggle_collapse)
         h_bar.addWidget(self.btn_toggle)
         main_layout.addLayout(h_bar)
 
+        # Collapsed vertical strip label
         self.collapsed_lbl = QLabel("C\nO\nN\nT\nR\nO\nL\nS")
         self.collapsed_lbl.setAlignment(Qt.AlignCenter)
         self.collapsed_lbl.setStyleSheet("color: #4A5568; font-size: 10px; font-weight: 900; letter-spacing: 3px;")
         self.collapsed_lbl.setVisible(False)
         main_layout.addWidget(self.collapsed_lbl, stretch=1)
 
-        # Controls Body
+        # Body Container
         self.controls_body = QWidget()
         body_layout = QVBoxLayout(self.controls_body)
         body_layout.setContentsMargins(4, 4, 4, 4)
         body_layout.setSpacing(11)
 
-        # Speed Selector
+        # Speed Selector (Phase 4.03: Speeds > 1x removed)
         speed_box = QHBoxLayout()
         speed_lbl = QLabel("Speed:")
         self.speed_combo = QComboBox()
@@ -637,23 +760,23 @@ class ControlSidebarWidget(QFrame):
         self.speed_combo.setCurrentText("1.0x")
         self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
         speed_box.addWidget(speed_lbl)
-        speed_box.addWidget(self.speed_combo)
+        speed_box.addWidget(self.speed_combo, stretch=1)
         body_layout.addLayout(speed_box)
 
         # Gain Slider
         gain_box = QVBoxLayout()
-        self.gain_val_lbl = QLabel("Waveform Gain: 1.0x")
+        self.gain_val_lbl = QLabel("Signal Gain: 1.0x")
         self.gain_slider = QSlider(Qt.Horizontal)
-        self.gain_slider.setRange(1, 100)
-        self.gain_slider.setValue(20)
+        self.gain_slider.setRange(2, 50)
+        self.gain_slider.setValue(10)
         self.gain_slider.valueChanged.connect(self._on_gain_changed)
         gain_box.addWidget(self.gain_val_lbl)
         gain_box.addWidget(self.gain_slider)
         body_layout.addLayout(gain_box)
 
-        # Window Slider
+        # Time Window Slider
         win_box = QVBoxLayout()
-        self.win_val_lbl = QLabel("Window Length: 4.0s")
+        self.win_val_lbl = QLabel("Time Window: 4.0s")
         self.win_slider = QSlider(Qt.Horizontal)
         self.win_slider.setRange(1, 10)
         self.win_slider.setValue(4)
@@ -673,87 +796,144 @@ class ControlSidebarWidget(QFrame):
         topo_box.addWidget(self.topo_slider)
         body_layout.addLayout(topo_box)
 
-        # FastICA Artifact Rejection Quick Box
-        ica_box = QFrame()
-        ica_box.setStyleSheet("background: #0D0F16; border: 1px solid #1A212E; border-radius: 4px; padding: 6px;")
-        ica_layout = QVBoxLayout(ica_box)
-        ica_layout.setSpacing(6)
+        body_layout.addSpacing(2)
 
-        ica_title = QLabel("SPATIAL RECONSTRUCTION")
-        ica_title.setStyleSheet("color: #00FFA3; font-size: 9px; font-weight: bold; letter-spacing: 0.5px;")
-        ica_layout.addWidget(ica_title)
+        # Phase 4.03: FastICA Artifact Removal Section
+        ica_title = QLabel("FASTICA ARTIFACT REMOVAL")
+        ica_title.setStyleSheet("color: #00FFA3; font-size: 10px; font-weight: 900; letter-spacing: 1px;")
+        body_layout.addWidget(ica_title)
 
-        self.chk_enable_ica = QCheckBox("Enable FastICA Filter")
+        self.chk_enable_ica = QCheckBox("Enable ICA Cleaning")
         self.chk_enable_ica.setChecked(False)
-        ica_layout.addWidget(self.chk_enable_ica)
+        self.chk_enable_ica.setToolTip("Instantly toggles cleaned vs. raw EEG across waveforms and topomaps")
+        body_layout.addWidget(self.chk_enable_ica)
 
+        preset_box = QVBoxLayout()
+        preset_box.setSpacing(3)
+        preset_lbl = QLabel("Artifact Mode Preset:")
+        preset_lbl.setStyleSheet("font-size: 10px; color: #8C9BAE;")
         self.combo_ica_preset = QComboBox()
         self.combo_ica_preset.addItems([
             "Ocular / Blinks (IC0)",
             "Ocular + Saccades (IC0, IC1)",
             "Aggressive EOG + EMG (IC0, IC1, IC2)"
         ])
-        ica_layout.addWidget(self.combo_ica_preset)
+        preset_box.addWidget(preset_lbl)
+        preset_box.addWidget(self.combo_ica_preset)
+        body_layout.addLayout(preset_box)
 
-        self.btn_recompute_ica = QPushButton("⚡ Recompute Spatial Filter")
+        self.btn_recompute_ica = QPushButton("⚡ Re-compute FastICA")
+        self.btn_recompute_ica.setToolTip("Run on-demand FastICA spatial decomposition across 64 channels")
         self.btn_recompute_ica.setStyleSheet("""
             QPushButton {
                 background: #14171E;
-                color: #00E5FF;
-                border: 1px solid #1E2B3D;
-                border-radius: 3px;
-                padding: 4px;
+                color: #00FFA3;
+                border: 1px solid #1F2737;
+                border-radius: 4px;
+                padding: 5px;
                 font-size: 10px;
                 font-weight: bold;
             }
-            QPushButton:hover { background: #1E2D42; }
+            QPushButton:hover {
+                background: #1F2737;
+                border-color: #00FFA3;
+            }
         """)
-        ica_layout.addWidget(self.btn_recompute_ica)
-        body_layout.addWidget(ica_box)
+        body_layout.addWidget(self.btn_recompute_ica)
 
-        # Phase 5: Quick BCI Intent Readout Card
-        bci_quick_box = QFrame()
-        bci_quick_box.setStyleSheet("background: #0D0F16; border: 1px solid #1A212E; border-radius: 4px; padding: 6px;")
-        bq_layout = QVBoxLayout(bci_quick_box)
-        bq_layout.setSpacing(4)
+        self.ica_status_lbl = QLabel("ICA: 16 Components Ready")
+        self.ica_status_lbl.setStyleSheet("color: #7A889B; font-size: 9px; font-style: italic;")
+        body_layout.addWidget(self.ica_status_lbl)
 
-        bq_title = QLabel("BCI MOTOR INTENT")
-        bq_title.setStyleSheet("color: #00E5FF; font-size: 9px; font-weight: bold; letter-spacing: 0.5px;")
-        bq_layout.addWidget(bq_title)
+        body_layout.addSpacing(2)
 
-        self.lbl_bci_quick_status = QLabel("Rest Baseline (92%)")
-        self.lbl_bci_quick_status.setStyleSheet("color: #00FFA3; font-size: 11px; font-weight: bold;")
-        bq_layout.addWidget(self.lbl_bci_quick_status)
-        body_layout.addWidget(bci_quick_box)
+        # DSP Filter Settings
+        filter_title = QLabel("DSP BANDPASS FILTERS")
+        filter_title.setStyleSheet("color: #00FFA3; font-size: 10px; font-weight: 900; letter-spacing: 1px;")
+        body_layout.addWidget(filter_title)
+
+        f_grid = QGridLayout()
+        f_grid.setSpacing(5)
+
+        f_grid.addWidget(QLabel("Low (Hz):"), 0, 0)
+        self.f_low = QLineEdit("1.0")
+        f_grid.addWidget(self.f_low, 0, 1)
+
+        f_grid.addWidget(QLabel("High (Hz):"), 1, 0)
+        self.f_high = QLineEdit("40.0")
+        f_grid.addWidget(self.f_high, 1, 1)
+
+        f_grid.addWidget(QLabel("Notch (Hz):"), 2, 0)
+        self.f_notch = QLineEdit("60.0")
+        f_grid.addWidget(self.f_notch, 2, 1)
+
+        body_layout.addLayout(f_grid)
+
+        btn_apply_filters = QPushButton("Apply Filters")
+        btn_apply_filters.setStyleSheet("""
+            QPushButton {
+                background: #14171E;
+                color: #00FFA3;
+                border: 1px solid #1F2737;
+                border-radius: 4px;
+                padding: 5px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #1F2737;
+                border-color: #00FFA3;
+            }
+        """)
+        btn_apply_filters.clicked.connect(self._on_apply_filters)
+        body_layout.addWidget(btn_apply_filters)
 
         body_layout.addStretch()
+
+        help_box = QLabel("Navigation:\n• Space: Play/Pause\n• F4: Toggle Sidebar\n• Scrub timeline to jump")
+        help_box.setStyleSheet("color: #4A5568; font-size: 10px; line-height: 14px;")
+        body_layout.addWidget(help_box)
+
         main_layout.addWidget(self.controls_body, stretch=1)
 
     def toggle_collapse(self):
         self.is_collapsed = not self.is_collapsed
         if self.is_collapsed:
-            self.setFixedWidth(36)
             self.controls_body.setVisible(False)
             self.title_lbl.setVisible(False)
             self.collapsed_lbl.setVisible(True)
+            self.setFixedWidth(36)
             self.btn_toggle.setText("▶")
+            self.btn_toggle.setToolTip("Expand Sidebar (F4)")
         else:
-            self.setFixedWidth(240)
-            self.controls_body.setVisible(True)
-            self.title_lbl.setVisible(True)
             self.collapsed_lbl.setVisible(False)
+            self.title_lbl.setVisible(True)
+            self.controls_body.setVisible(True)
+            self.setFixedWidth(240)
             self.btn_toggle.setText("◀")
+            self.btn_toggle.setToolTip("Collapse Sidebar (F4)")
 
     def _on_speed_changed(self, text: str):
         speed_map = {"0.1x": 0.1, "0.25x": 0.25, "0.5x": 0.5, "1.0x": 1.0}
         self.engine.set_speed(speed_map.get(text, 1.0))
 
     def _on_gain_changed(self, val: int):
-        gain = val / 20.0
-        self.gain_val_lbl.setText(f"Waveform Gain: {gain:.2f}x")
+        gain = val / 10.0
+        self.gain_val_lbl.setText(f"Signal Gain: {gain:.1f}x")
 
     def _on_win_changed(self, val: int):
-        self.win_val_lbl.setText(f"Window Length: {val:.1f}s")
+        self.win_val_lbl.setText(f"Time Window: {val:.1f}s")
 
     def _on_topo_changed(self, val: int):
         self.topo_val_lbl.setText(f"Topomap Limit: ±{val} µV")
+
+    def _on_apply_filters(self):
+        try:
+            l_val = float(self.f_low.text())
+            h_val = float(self.f_high.text())
+            n_val = float(self.f_notch.text())
+            self.data_loader.apply_dsp_filters(l_val, h_val, n_val)
+        except ValueError:
+            print("[WARN] Invalid DSP filter parameters entered.")
+
+
